@@ -78,8 +78,9 @@ tmux set-option -t agent -g history-limit 20000
 log "starting agent: ${RV_AGENT}"
 tmux send-keys -t agent "$RV_AGENT_CMD" Enter
 
-# Report readiness only once the agent process is actually up; the daemon turns
-# this into the "starting" -> "running" transition on the phone.
+# Wait for the agent to come up so the startup logs say what happened. The
+# container HEALTHCHECK is what the daemon actually reads for session status;
+# this marker exists only to timestamp the transition in the logs.
 for _ in $(seq 1 60); do
   if pgrep -u "$(id -u)" -f "${RV_AGENT:-claude}" >/dev/null 2>&1; then
     touch "$STATE_DIR/ready"
@@ -88,13 +89,16 @@ for _ in $(seq 1 60); do
   fi
   sleep 2
 done
-[[ -f "$STATE_DIR/ready" ]] || log "agent did not report in within 120s; leaving the session open for inspection"
+[[ -f "$STATE_DIR/ready" ]] || log "agent did not report in within 120s; leaving the session open for inspection (docker exec -it <container> tmux attach -t agent)"
 
 # --- supervise --------------------------------------------------------------
 term() { log "stopping"; tmux kill-server 2>/dev/null || true; exit 0; }
 trap term TERM INT
 
+# A signal that lands on the sleep (rather than on this shell) must not be
+# allowed to take the container down with it — under `set -e` an interrupted
+# sleep would otherwise end the supervisor and kill a perfectly good session.
 while tmux has-session -t agent 2>/dev/null; do
-  sleep 5
+  sleep 5 || true
 done
 log "tmux session ended; container exiting"

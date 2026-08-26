@@ -22,12 +22,18 @@ reading carefully.
 
 ## Status
 
-Written and reviewed; **not yet exercised end to end.** The Go daemon builds
-and the container image is straightforward, but the VPS, Tailscale and systemd
-paths are documented rather than tested, and one premise needs confirming on
-your own account before you trust the rest:
+Partly exercised. What has actually been run, on a laptop, against a public
+repo with a stub standing in for the agent: the image builds, the container
+clones and starts tmux, the daemon lists sessions from Docker labels, the logs
+endpoint returns both streams, killing the agent flips the session to *error*
+while leaving the container up for inspection, and a container restart resumes
+the same workspace and agent home.
 
-> does a containerised `claude --remote-control` session appear in the iOS app?
+What has **not** been run: the VPS, Tailscale and systemd paths (documented,
+not tested), and the premise the whole thing rests on —
+
+> does a containerised `claude --remote-control` session appear in the iOS app,
+> under the credentials you gave it?
 
 `make verify` answers exactly that, in about a minute, without involving the
 daemon. Run it first.
@@ -85,7 +91,7 @@ is *where the credential lives afterwards*.
 your env file as `CLAUDE_CODE_OAUTH_TOKEN`; the daemon forwards it to every
 container.
 
-- containers stay stateless — no shared files, no refresh races
+- no shared credential file, so no refresh races between sessions
 - when the token expires, `make auth` again and restart the daemon
 - running sessions keep working on the credential they already have
 
@@ -93,7 +99,7 @@ container.
 
 `make auth` opens an interactive Claude session in a container whose `~/.claude`
 is bind-mounted from `$RV_STATE_DIR/agent-home`. You `/login` once; every
-session container mounts the same directory.
+session container mounts that directory *in place of* its per-session home.
 
 - nothing to re-paste: Claude refreshes the credential in place
 - but all sessions share one config directory, so concurrent writes to
@@ -122,15 +128,28 @@ restarts with `unless-stopped`. *tmux* is the durable TTY inside it, so the
 agent survives anything happening to the daemon. *Remote Control* is the link
 to your phone, and it is the only one of the three that talks to Anthropic.
 
-**Starting is idempotent.** Session id, container name and workspace volume all
-derive from the repo slug, so tapping a repo twice reattaches instead of
-spawning a duplicate. Stopping a session keeps its workspace volume, so
-restarting it resumes the same checkout, branch and uncommitted work; pass
-`?purge=1` to `DELETE` to throw the checkout away too.
+**Starting is idempotent.** Session id, container name and volumes all derive
+from the repo slug, so tapping a repo twice reattaches instead of spawning a
+duplicate. (The slug flattens punctuation, so `owner/my.repo` and
+`owner/my-repo` would collide — rename one if you own both.)
 
-**Readiness is real.** The container's `HEALTHCHECK` goes healthy only once the
-agent process is actually up, which is what the phone UI shows as
-*starting → running* — not merely "the container exists".
+**Sessions survive restarts.** Each session gets two volumes: the checkout at
+`/workspace`, and the agent's own home at `/home/vibe/.claude`. The second one
+is what makes a reboot resume the conversation instead of quietly starting a
+blank session under the same name. Stopping a session keeps both, so restarting
+it picks up the same branch, the same uncommitted work and the same context;
+pass `?purge=1` to `DELETE` to throw all of it away.
+
+**Readiness is real.** The container's `HEALTHCHECK` reports healthy only while
+the agent process is actually alive in tmux, which is what the phone UI shows
+as *starting → running*. It is a liveness check, not a one-time flag: if the
+agent dies, the session goes back to *error* rather than lying about being
+attachable.
+
+**Logs show the part that matters.** The agent runs in a detached tmux pane, so
+nothing it prints reaches `docker logs` — including the auth error you are
+looking for. `/api/sessions/{id}/logs` returns the container startup output
+*and* a capture of the agent pane.
 
 **The agent layer is pluggable.** A driver contributes environment variable
 names and one command line; the entrypoint runs whatever `RV_AGENT_CMD` it is
@@ -148,8 +167,13 @@ That is the actual trade. If you would rather keep approvals, set
 `RV_PERMISSION_MODE=acceptEdits` and answer prompts in the app. Scope the PAT
 to the repositories you actually hack on from your phone, not to everything.
 
-The container runs as an unprivileged user, has no Docker socket, and gets
-whatever CPU and memory caps you set in `RV_CPUS` / `RV_MEMORY`.
+The container runs as an unprivileged user by default, but that user has
+passwordless sudo — installing a missing build dependency from your phone is
+otherwise impossible — so with `bypassPermissions` the agent can become root
+*inside its own container* whenever it wants. What it does not get is the
+Docker socket, `--privileged`, or anything of the host: the boundary is the
+container, not the user inside it. CPU and memory caps come from `RV_CPUS` and
+`RV_MEMORY`.
 
 ## Security model
 
@@ -174,7 +198,7 @@ whatever CPU and memory caps you set in `RV_CPUS` / `RV_MEMORY`.
 | `GET` | `/api/sessions` | live sessions, derived from Docker |
 | `POST` | `/api/sessions` | `{"repo":"owner/name","branch":"main","agent":"claude"}` |
 | `DELETE` | `/api/sessions/{id}?purge=1` | stop; `purge` also drops the workspace |
-| `GET` | `/api/sessions/{id}/logs?tail=200` | container logs, text/plain |
+| `GET` | `/api/sessions/{id}/logs?tail=200` | startup log + agent tmux pane, text/plain |
 | `GET` | `/healthz` | docker reachable, image present, auth mode |
 
 ## Working inside a session

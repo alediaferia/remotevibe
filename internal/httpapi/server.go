@@ -46,10 +46,12 @@ type Server struct {
 
 	mu    sync.Mutex
 	notes map[string]string // sessionID -> last failure message
+	busy  map[string]bool   // sessionIDs with a start in flight
 }
 
 func New(cfg *config.Config, docker *dockerx.Client, gh *ghclient.Client, web fs.FS, log *slog.Logger) *Server {
-	return &Server{cfg: cfg, docker: docker, gh: gh, web: web, log: log, notes: map[string]string{}}
+	return &Server{cfg: cfg, docker: docker, gh: gh, web: web, log: log,
+		notes: map[string]string{}, busy: map[string]bool{}}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -89,6 +91,34 @@ func slug(repo string) string {
 
 func (s *Server) containerName(id string) string { return s.cfg.ContainerName + id }
 func (s *Server) volumeName(id string) string    { return s.cfg.WorkspacePrefix + id }
+
+// homeVolume holds the agent's own state (its conversation, above all) so a
+// container restart resumes the session instead of silently starting a new one
+// under the same name. It is per session, not shared, which keeps concurrent
+// sessions off each other's config file.
+func (s *Server) homeVolume(id string) string { return s.cfg.HomePrefix + id }
+
+func (s *Server) sessionVolumes(id string) []string {
+	return []string{s.volumeName(id), s.homeVolume(id)}
+}
+
+// acquire marks a session id as having a start in flight, so two taps cannot
+// race past the "does it already exist" check into a duplicate docker run.
+func (s *Server) acquire(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.busy[id] {
+		return false
+	}
+	s.busy[id] = true
+	return true
+}
+
+func (s *Server) release(id string) {
+	s.mu.Lock()
+	delete(s.busy, id)
+	s.mu.Unlock()
+}
 
 // --- handlers --------------------------------------------------------------
 
@@ -188,19 +218,29 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	id := slug(repo.FullName)
 	name := s.containerName(id)
 
-	// Idempotent start: an existing container for this repo wins.
+	if !s.acquire(id) {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error": "a session for this repository is already starting",
+		})
+		return
+	}
+	defer s.release(id)
+
+	// Idempotent start: an existing container for this repo wins. A stopped one
+	// is replaced, but its volumes survive, so the checkout and the agent's
+	// conversation carry over.
 	if existing, err := s.docker.Inspect(r.Context(), name); err == nil && existing != nil {
-		if existing.State != "running" {
-			// A stopped session is revived rather than duplicated.
-			if _, err := s.docker.Exec(r.Context(), name, "true"); err != nil {
-				s.log.Info("restarting stopped session", "session", id)
-			}
-			s.docker.Remove(r.Context(), name, "", false)
-		} else {
+		if existing.State == "running" {
 			writeJSON(w, http.StatusConflict, map[string]any{
 				"error":   "a session for this repository is already running",
 				"session": s.toSession(*existing),
 			})
+			return
+		}
+		s.log.Info("replacing stopped session container", "session", id)
+		if err := s.docker.Remove(r.Context(), name, nil, false); err != nil {
+			writeErr(w, http.StatusInternalServerError,
+				fmt.Errorf("could not clear the previous container for this repository: %w", err))
 			return
 		}
 	}
@@ -236,12 +276,17 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 			}),
 			"RV_SESSION_ID": id,
 		},
-		Volumes: []string{s.volumeName(id) + ":/workspace"},
-		CPUs:    s.cfg.CPUs,
-		Memory:  s.cfg.Memory,
+		Volumes: []string{
+			s.volumeName(id) + ":/workspace",
+			s.homeVolume(id) + ":/home/vibe/.claude",
+		},
+		CPUs:   s.cfg.CPUs,
+		Memory: s.cfg.Memory,
 	}
 	if s.cfg.AuthMode == config.AuthSharedHome {
-		spec.Volumes = append(spec.Volumes, s.cfg.AgentHomeDir()+":/home/vibe/.claude")
+		// Shared credentials replace the per-session home entirely: one login,
+		// refreshed in place, at the cost of a shared config file.
+		spec.Volumes[1] = s.cfg.AgentHomeDir() + ":/home/vibe/.claude"
 	}
 
 	if !s.docker.ImageExists(r.Context(), s.cfg.Image) {
@@ -276,7 +321,7 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dropVolume := r.URL.Query().Get("purge") == "1"
-	if err := s.docker.Remove(r.Context(), s.containerName(id), s.volumeName(id), dropVolume); err != nil {
+	if err := s.docker.Remove(r.Context(), s.containerName(id), s.sessionVolumes(id), dropVolume); err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -288,14 +333,28 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	id := slug(r.PathValue("id"))
 	tail, _ := strconv.Atoi(r.URL.Query().Get("tail"))
-	out, err := s.docker.Logs(r.Context(), s.containerName(id), tail)
+	name := s.containerName(id)
+	out, err := s.docker.Logs(r.Context(), name, tail)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, err)
 		return
 	}
+
+	// The startup log says whether the clone worked; the tmux pane says whether
+	// the agent is happy. Anyone reading logs from a phone needs both.
+	var b strings.Builder
+	b.WriteString("=== container startup ===\n")
+	b.WriteString(out)
+	b.WriteString("\n=== agent pane ===\n")
+	if pane, err := s.docker.PaneLogs(r.Context(), name, tail); err == nil {
+		b.WriteString(pane)
+	} else {
+		b.WriteString("(unavailable: " + err.Error() + ")\n")
+	}
+
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	_, _ = w.Write([]byte(out))
+	_, _ = w.Write([]byte(b.String()))
 }
 
 // --- session mapping -------------------------------------------------------

@@ -209,18 +209,35 @@ func (c *Client) Logs(ctx context.Context, name string, tail int) (string, error
 	return out.String(), nil
 }
 
-// Remove stops and deletes a container. The workspace volume is kept unless
-// removeVolume is set, so a restarted session resumes the same checkout.
-func (c *Client) Remove(ctx context.Context, name, volume string, removeVolume bool) error {
+// Remove stops and deletes a container. Its volumes are kept unless
+// removeVolumes is set, so a restarted session resumes the same checkout and
+// the same agent conversation.
+func (c *Client) Remove(ctx context.Context, name string, volumes []string, removeVolumes bool) error {
 	if _, err := c.run(ctx, "rm", "-f", name); err != nil && !strings.Contains(err.Error(), "No such") {
 		return err
 	}
-	if removeVolume && volume != "" {
-		if _, err := c.run(ctx, "volume", "rm", volume); err != nil && !strings.Contains(err.Error(), "No such") {
+	if !removeVolumes {
+		return nil
+	}
+	for _, v := range volumes {
+		if v == "" {
+			continue
+		}
+		if _, err := c.run(ctx, "volume", "rm", v); err != nil && !strings.Contains(err.Error(), "No such") {
 			return err
 		}
 	}
 	return nil
+}
+
+// PaneLogs returns the tail of the tmux pane the agent runs in. The pane is
+// detached, so nothing it prints — including auth failures, which is exactly
+// when you go looking — ever reaches the container's stdout.
+func (c *Client) PaneLogs(ctx context.Context, name string, lines int) (string, error) {
+	if lines <= 0 {
+		lines = 200
+	}
+	return c.Exec(ctx, name, "tmux", "capture-pane", "-p", "-t", "agent", "-S", fmt.Sprintf("-%d", lines))
 }
 
 // Exec runs a command inside a container and returns its stdout.

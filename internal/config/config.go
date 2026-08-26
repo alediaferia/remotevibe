@@ -32,6 +32,7 @@ type Config struct {
 	Image           string
 	ContainerName   string // prefix for session containers
 	WorkspacePrefix string // prefix for per-session workspace volumes
+	HomePrefix      string // prefix for per-session agent-home volumes
 	CPUs            string
 	Memory          string
 
@@ -75,6 +76,7 @@ func Load() (*Config, error) {
 		Image:           env("RV_AGENT_IMAGE", "remotevibe/agent:latest"),
 		ContainerName:   env("RV_CONTAINER_PREFIX", "rv-"),
 		WorkspacePrefix: env("RV_VOLUME_PREFIX", "rv-ws-"),
+		HomePrefix:      env("RV_HOME_VOLUME_PREFIX", "rv-home-"),
 		CPUs:            env("RV_CPUS", ""),
 		Memory:          env("RV_MEMORY", ""),
 		GitHubToken:     env("RV_GITHUB_TOKEN", os.Getenv("GITHUB_TOKEN")),
