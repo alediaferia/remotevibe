@@ -1,0 +1,35 @@
+[Unit]
+Description=remotevibe control plane
+Documentation=https://github.com/alediaferia/remotevibe
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+# The daemon spawns containers, so it needs Docker socket access. Give it its
+# own user in the docker group rather than running it as root — membership of
+# that group is already root-equivalent, no need to compound it.
+User=remotevibe
+Group=docker
+EnvironmentFile=/etc/remotevibe.env
+ExecStart=/usr/local/bin/remotevibed
+Restart=on-failure
+RestartSec=3
+
+StateDirectory=remotevibe
+StateDirectoryMode=0700
+
+# Session containers are the sandbox; the daemon itself needs very little.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/remotevibe
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

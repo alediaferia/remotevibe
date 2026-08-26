@@ -1,0 +1,366 @@
+// Package httpapi serves the phone-facing JSON API and the PWA that drives it.
+//
+// There is no authentication layer here on purpose: remotevibe binds to
+// localhost and is exposed to exactly one tailnet by `tailscale serve`. Adding
+// a login screen to a single-user, tailnet-only service buys nothing.
+package httpapi
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io/fs"
+	"log/slog"
+	"net/http"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/alediaferia/remotevibe/internal/agent"
+	"github.com/alediaferia/remotevibe/internal/config"
+	"github.com/alediaferia/remotevibe/internal/dockerx"
+	"github.com/alediaferia/remotevibe/internal/ghclient"
+)
+
+// Session is the API representation of one running agent.
+type Session struct {
+	ID        string    `json:"id"`
+	Repo      string    `json:"repo"`
+	Branch    string    `json:"branch"`
+	Agent     string    `json:"agent"`
+	Name      string    `json:"name"`
+	Status    string    `json:"status"` // starting | running | stopped | error
+	Container string    `json:"container"`
+	CreatedAt time.Time `json:"created_at"`
+	Message   string    `json:"message,omitempty"`
+}
+
+type Server struct {
+	cfg    *config.Config
+	docker *dockerx.Client
+	gh     *ghclient.Client
+	web    fs.FS
+	log    *slog.Logger
+
+	mu    sync.Mutex
+	notes map[string]string // sessionID -> last failure message
+}
+
+func New(cfg *config.Config, docker *dockerx.Client, gh *ghclient.Client, web fs.FS, log *slog.Logger) *Server {
+	return &Server{cfg: cfg, docker: docker, gh: gh, web: web, log: log, notes: map[string]string{}}
+}
+
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", s.handleHealth)
+	mux.HandleFunc("GET /api/repos", s.handleRepos)
+	mux.HandleFunc("GET /api/agents", s.handleAgents)
+	mux.HandleFunc("GET /api/sessions", s.handleListSessions)
+	mux.HandleFunc("POST /api/sessions", s.handleCreateSession)
+	mux.HandleFunc("DELETE /api/sessions/{id}", s.handleDeleteSession)
+	mux.HandleFunc("GET /api/sessions/{id}/logs", s.handleLogs)
+	mux.Handle("/", http.FileServer(http.FS(s.web)))
+	return mux
+}
+
+// --- helpers ---------------------------------------------------------------
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeErr(w http.ResponseWriter, status int, err error) {
+	writeJSON(w, status, map[string]string{"error": err.Error()})
+}
+
+var slugRe = regexp.MustCompile(`[^a-z0-9]+`)
+
+// slug turns "Owner/My.Repo" into "owner-my-repo": the session id, the
+// container suffix and the volume suffix all derive from it, which is what
+// makes "start" idempotent per repository.
+func slug(repo string) string {
+	return strings.Trim(slugRe.ReplaceAllString(strings.ToLower(repo), "-"), "-")
+}
+
+func (s *Server) containerName(id string) string { return s.cfg.ContainerName + id }
+func (s *Server) volumeName(id string) string    { return s.cfg.WorkspacePrefix + id }
+
+// --- handlers --------------------------------------------------------------
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	resp := map[string]any{"ok": true, "auth_mode": s.cfg.AuthMode, "image": s.cfg.Image}
+	if err := s.docker.Ping(r.Context()); err != nil {
+		resp["ok"] = false
+		resp["error"] = err.Error()
+		writeJSON(w, http.StatusServiceUnavailable, resp)
+		return
+	}
+	resp["image_present"] = s.docker.ImageExists(r.Context(), s.cfg.Image)
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleRepos(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("refresh") == "1" {
+		s.gh.Invalidate()
+	}
+	repos, err := s.gh.List(r.Context(), r.URL.Query().Get("q"))
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err)
+		return
+	}
+	if repos == nil {
+		repos = []ghclient.Repo{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"repos": repos})
+}
+
+func (s *Server) handleAgents(w http.ResponseWriter, _ *http.Request) {
+	type item struct {
+		Name      string `json:"name"`
+		Supported bool   `json:"supported"`
+		Reason    string `json:"reason,omitempty"`
+	}
+	out := make([]item, 0, len(agent.Registry))
+	for _, d := range agent.Registry {
+		it := item{Name: d.Name(), Supported: true}
+		if err := d.Supported(); err != nil {
+			it.Supported, it.Reason = false, err.Error()
+		}
+		out = append(out, it)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"agents": out})
+}
+
+func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
+	sessions, err := s.sessions(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"sessions": sessions})
+}
+
+type createRequest struct {
+	Repo   string `json:"repo"`
+	Branch string `json:"branch"`
+	Agent  string `json:"agent"`
+}
+
+func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
+	var req createRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid JSON body: %w", err))
+		return
+	}
+	req.Repo = strings.TrimSpace(req.Repo)
+	if req.Repo == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("repo is required"))
+		return
+	}
+
+	drv, err := agent.Get(strings.TrimSpace(req.Agent))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := drv.Supported(); err != nil {
+		writeErr(w, http.StatusNotImplemented, err)
+		return
+	}
+
+	// The repo must be visible to the token; this also gives us the default
+	// branch and a canonical owner/name spelling.
+	repo, err := s.gh.Get(r.Context(), req.Repo)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	branch := strings.TrimSpace(req.Branch)
+	if branch == "" {
+		branch = repo.DefaultBranch
+	}
+
+	id := slug(repo.FullName)
+	name := s.containerName(id)
+
+	// Idempotent start: an existing container for this repo wins.
+	if existing, err := s.docker.Inspect(r.Context(), name); err == nil && existing != nil {
+		if existing.State != "running" {
+			// A stopped session is revived rather than duplicated.
+			if _, err := s.docker.Exec(r.Context(), name, "true"); err != nil {
+				s.log.Info("restarting stopped session", "session", id)
+			}
+			s.docker.Remove(r.Context(), name, "", false)
+		} else {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":   "a session for this repository is already running",
+				"session": s.toSession(*existing),
+			})
+			return
+		}
+	}
+
+	sessionName := repo.Name
+	if s.cfg.SessionPrefix != "" {
+		sessionName = s.cfg.SessionPrefix + "/" + repo.Name
+	}
+
+	spec := dockerx.RunSpec{
+		Name:  name,
+		Image: s.cfg.Image,
+		Labels: map[string]string{
+			dockerx.LabelSession: "1",
+			dockerx.LabelRepo:    repo.FullName,
+			dockerx.LabelBranch:  branch,
+			dockerx.LabelAgent:   drv.Name(),
+			dockerx.LabelName:    sessionName,
+			dockerx.LabelCreated: time.Now().UTC().Format(time.RFC3339),
+		},
+		EnvPass: append([]string{"RV_GITHUB_TOKEN", "RV_GIT_NAME", "RV_GIT_EMAIL"}, drv.Env()...),
+		Env: map[string]string{
+			"RV_REPO":   repo.FullName,
+			"RV_BRANCH": branch,
+			"RV_AGENT":  drv.Name(),
+			"RV_AGENT_CMD": drv.Command(agent.Spec{
+				Repo:           repo.FullName,
+				Branch:         branch,
+				SessionName:    sessionName,
+				PermissionMode: s.cfg.PermissionMode,
+				Model:          s.cfg.Model,
+				ExtraArgs:      s.cfg.ExtraArgs,
+			}),
+			"RV_SESSION_ID": id,
+		},
+		Volumes: []string{s.volumeName(id) + ":/workspace"},
+		CPUs:    s.cfg.CPUs,
+		Memory:  s.cfg.Memory,
+	}
+	if s.cfg.AuthMode == config.AuthSharedHome {
+		spec.Volumes = append(spec.Volumes, s.cfg.AgentHomeDir()+":/home/vibe/.claude")
+	}
+
+	if !s.docker.ImageExists(r.Context(), s.cfg.Image) {
+		writeErr(w, http.StatusPreconditionFailed,
+			fmt.Errorf("agent image %s is not built — run `make image` on the VPS", s.cfg.Image))
+		return
+	}
+
+	if _, err := s.docker.Run(r.Context(), spec); err != nil {
+		s.setNote(id, err.Error())
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.clearNote(id)
+	s.log.Info("session started", "session", id, "repo", repo.FullName, "branch", branch, "agent", drv.Name())
+
+	ct, err := s.docker.Inspect(r.Context(), name)
+	if err != nil || ct == nil {
+		writeJSON(w, http.StatusCreated, map[string]any{"session": Session{
+			ID: id, Repo: repo.FullName, Branch: branch, Agent: drv.Name(),
+			Name: sessionName, Status: "starting", Container: name, CreatedAt: time.Now().UTC(),
+		}})
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"session": s.toSession(*ct)})
+}
+
+func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
+	id := slug(r.PathValue("id"))
+	if id == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("missing session id"))
+		return
+	}
+	dropVolume := r.URL.Query().Get("purge") == "1"
+	if err := s.docker.Remove(r.Context(), s.containerName(id), s.volumeName(id), dropVolume); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.clearNote(id)
+	s.log.Info("session stopped", "session", id, "purged", dropVolume)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
+	id := slug(r.PathValue("id"))
+	tail, _ := strconv.Atoi(r.URL.Query().Get("tail"))
+	out, err := s.docker.Logs(r.Context(), s.containerName(id), tail)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write([]byte(out))
+}
+
+// --- session mapping -------------------------------------------------------
+
+func (s *Server) sessions(ctx context.Context) ([]Session, error) {
+	containers, err := s.docker.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Session, 0, len(containers))
+	for _, ct := range containers {
+		out = append(out, s.toSession(ct))
+	}
+	return out, nil
+}
+
+func (s *Server) toSession(ct dockerx.Container) Session {
+	id := strings.TrimPrefix(ct.Name, s.cfg.ContainerName)
+	sess := Session{
+		ID:        id,
+		Repo:      ct.Labels[dockerx.LabelRepo],
+		Branch:    ct.Labels[dockerx.LabelBranch],
+		Agent:     ct.Labels[dockerx.LabelAgent],
+		Name:      ct.Labels[dockerx.LabelName],
+		Container: ct.Name,
+		Message:   s.note(id),
+	}
+	if t, err := time.Parse(time.RFC3339, ct.Labels[dockerx.LabelCreated]); err == nil {
+		sess.CreatedAt = t
+	} else {
+		sess.CreatedAt = ct.Started
+	}
+
+	// The container's HEALTHCHECK is what distinguishes "the container is up"
+	// from "the agent is actually registered and waiting on the phone".
+	switch {
+	case ct.State != "running":
+		sess.Status = "stopped"
+	case ct.Health == "healthy":
+		sess.Status = "running"
+	case ct.Health == "unhealthy":
+		sess.Status = "error"
+		if sess.Message == "" {
+			sess.Message = "the agent process is not running inside the container — check the logs"
+		}
+	default:
+		sess.Status = "starting"
+	}
+	return sess
+}
+
+func (s *Server) setNote(id, msg string) {
+	s.mu.Lock()
+	s.notes[id] = msg
+	s.mu.Unlock()
+}
+
+func (s *Server) clearNote(id string) {
+	s.mu.Lock()
+	delete(s.notes, id)
+	s.mu.Unlock()
+}
+
+func (s *Server) note(id string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.notes[id]
+}

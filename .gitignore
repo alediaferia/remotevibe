@@ -1,0 +1,12 @@
+# secrets
+.env
+*.env
+!.env.example
+
+# build output
+/bin/
+/remotevibed
+
+# local state
+/state/
+.DS_Store
