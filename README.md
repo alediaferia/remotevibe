@@ -24,7 +24,9 @@ reading carefully.
 
 Working, with one path still untested. Confirmed on real hardware: a
 containerised `claude --remote-control` session **does** register and show up
-in the Claude iOS app, on a Pro subscription, with no API key involved.
+in the Claude iOS app, on a Pro subscription, with no API key involved — given
+a profile that is already signed in, which is what `seeded` mode exists to
+provide.
 
 Exercised locally: the image builds, the container clones and starts tmux, the
 daemon lists sessions from Docker labels, the logs endpoint returns both the
@@ -113,14 +115,14 @@ Every session mounts that same profile directly instead of copying it.
 - nothing to re-seed, and a refresh in one session benefits all of them
 - but concurrent sessions write to one config file and one session history
 
-### `RV_AUTH_MODE=token`
+### There is no token mode
 
-`make auth` runs `claude setup-token` and prints a long-lived token, forwarded
-to containers as `CLAUDE_CODE_OAUTH_TOKEN`, with no profile seeded.
-
-- nothing on disk to keep in sync
-- but a token carries no account record, so Remote Control may still stop and
-  ask you to sign in. Verify before relying on it.
+`claude setup-token` looks like the obvious fit — a long-lived credential, no
+files to sync — and it was the original default here. It does not work: the
+token carries no account record, and a Remote Control session stops and asks
+for a full browser sign-in with different scopes regardless. Setting
+`RV_AUTH_MODE=token` now fails at startup with that explanation rather than
+wasting your time.
 
 ### Refreshing
 
@@ -202,11 +204,12 @@ container, not the user inside it. CPU and memory caps come from `RV_CPUS` and
   published by `tailscale serve`. There is no login screen because a
   single-user, tailnet-only service gains nothing from one — do not expose the
   port publicly.
-- **Secrets travel by name.** The daemon forwards `RV_GITHUB_TOKEN` and
-  `CLAUDE_CODE_OAUTH_TOKEN` with `docker run -e NAME`, inheriting values from
-  its own environment, so they never appear in the process table. They *are*
-  visible in `docker inspect` output for the running container, as environment
-  variables always are.
+- **Secrets travel by name.** The daemon forwards `RV_GITHUB_TOKEN` with
+  `docker run -e NAME`, inheriting the value from its own environment, so it
+  never appears in the process table. It *is* visible in `docker inspect`
+  output for the running container, as environment variables always are. The
+  Claude credential never travels as an environment variable at all — it is a
+  file in the session's profile volume.
 - **Nothing is baked into the image.** Tokens live in `.env` (gitignored) or
   `/etc/remotevibe.env` (0600).
 

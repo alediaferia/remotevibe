@@ -59,8 +59,12 @@ type Claude struct{}
 
 func (Claude) Name() string     { return "claude" }
 func (Claude) Supported() error { return nil }
+
+// Env deliberately does not forward CLAUDE_CODE_OAUTH_TOKEN: an env token
+// shadows the seeded profile without being sufficient on its own, which turns a
+// working session into a sign-in prompt.
 func (Claude) Env() []string {
-	return []string{"CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_MODEL"}
+	return []string{"ANTHROPIC_MODEL"}
 }
 
 func (Claude) Command(s Spec) string {

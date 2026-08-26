@@ -29,13 +29,14 @@ case "$MODE" in
     args+=(-v "$HOME_DIR:/rv/auth:ro")
     LAUNCH="cp -a /rv/auth/. $CONFIG_DIR/ && $LAUNCH"
     ;;
-  token)
-    [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]] || { echo "CLAUDE_CODE_OAUTH_TOKEN is empty; run make auth" >&2; exit 1; }
-    args+=(-e CLAUDE_CODE_OAUTH_TOKEN)
-    ;;
   shared-home)
     [[ -f "$HOME_DIR/.credentials.json" ]] || { echo "No profile in $HOME_DIR; run make auth" >&2; exit 1; }
     args+=(-v "$HOME_DIR:$CONFIG_DIR")
+    ;;
+  *)
+    echo "RV_AUTH_MODE=$MODE is not a mode this tool supports (expected seeded or shared-home)." >&2
+    echo "RV_AUTH_MODE=token was removed: a setup-token does not satisfy Remote Control." >&2
+    exit 2
     ;;
 esac
 
@@ -45,8 +46,9 @@ Starting an interactive Claude session named "$SESSION_NAME" in a throwaway
 container. Open the Claude app on your phone and look for it.
 
   - it appears, no login asked -> the flow works; phone-started sessions will too
-  - it asks you to sign in      -> the profile is not reaching the container;
-                                   try RV_AUTH_MODE=seeded and re-run make auth
+  - it asks you to sign in      -> the profile is not reaching the container:
+                                   check $HOME_DIR holds .credentials.json
+                                   *and* .claude.json, then re-run make auth
   - nothing on the phone        -> it registered locally but did not publish;
                                    check the session name in the app
 

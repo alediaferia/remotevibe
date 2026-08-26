@@ -19,7 +19,7 @@ the current behaviour was checked:
 
 ```bash
 # daemon: everything except /api/repos works with a junk token
-RV_GITHUB_TOKEN=dummy CLAUDE_CODE_OAUTH_TOKEN=dummy RV_ADDR=127.0.0.1:8799 ./bin/remotevibed
+RV_GITHUB_TOKEN=dummy RV_STATE_DIR=$PWD/state RV_ADDR=127.0.0.1:8799 ./bin/remotevibed
 
 # container: a public repo and a stub in place of the agent
 docker run -d --name rv-test --init \
@@ -41,6 +41,11 @@ A Claude login is two files: `.credentials.json` and, separately,
 `.claude.json` (the account record). Persist only the first and the agent asks
 to sign in again — which a phone-started container cannot answer. The image
 sets `CLAUDE_CONFIG_DIR` so both land in one directory; keep them together.
+
+`CLAUDE_CODE_OAUTH_TOKEN` is not a shortcut: a `claude setup-token` token does
+not satisfy Remote Control, which asks for a browser sign-in anyway. The daemon
+neither accepts a `token` auth mode nor forwards that variable into containers,
+because an env token shadows a working profile. Do not reintroduce either.
 
 `scripts/verify-remote-control.sh` is the check, and it needs the maintainer's
 account. It has confirmed that a containerised `claude --remote-control`

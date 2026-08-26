@@ -25,7 +25,12 @@ docker image inspect "$IMAGE" >/dev/null 2>&1 || {
 
 case "$MODE" in
 seeded | shared-home)
-  mkdir -p "$HOME_DIR"
+  mkdir -p "$HOME_DIR" 2>/dev/null || {
+    echo "Cannot create $HOME_DIR." >&2
+    echo "On a VPS: sudo install -d -o \"$(id -un)\" -m 0700 $HOME_DIR" >&2
+    echo "On a laptop: set RV_STATE_DIR=\$PWD/state in $ENV_FILE" >&2
+    exit 1
+  }
   cat <<TXT
 Mode: $MODE
 
@@ -51,35 +56,8 @@ TXT
   fi
   ;;
 
-token)
-  cat <<'TXT'
-Mode: token
-
-You will be shown a URL to open, then asked to paste a code back. The result is
-a long-lived token that every session container receives as
-CLAUDE_CODE_OAUTH_TOKEN, with no profile seeded alongside it.
-
-Note: a token on its own may not be enough for Remote Control, since the agent
-also wants an account record it can only get from a sign-in. Run
-./scripts/verify-remote-control.sh afterwards; if it drops you into a login
-prompt, use RV_AUTH_MODE=seeded instead.
-
-TXT
-  # --entrypoint bash: the image's own entrypoint expects a session to clone.
-  docker run --rm -it --entrypoint bash "$IMAGE" -lc 'claude setup-token'
-  cat <<TXT
-
-Copy the token printed above into $ENV_FILE:
-
-    RV_AUTH_MODE=token
-    CLAUDE_CODE_OAUTH_TOKEN=<the token>
-
-then restart the daemon (sudo systemctl restart remotevibed).
-TXT
-  ;;
-
 *)
-  echo "Unknown RV_AUTH_MODE: $MODE (expected seeded, token or shared-home)" >&2
+  echo "Unknown RV_AUTH_MODE: $MODE (expected seeded or shared-home)" >&2
   exit 2
   ;;
 esac

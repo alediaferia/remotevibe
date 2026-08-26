@@ -24,9 +24,6 @@ const (
 	// sessions still own their credentials, conversation and project state
 	// separately afterwards.
 	AuthSeeded = "seeded"
-	// AuthToken forwards a long-lived OAuth token (from `claude setup-token`)
-	// as CLAUDE_CODE_OAUTH_TOKEN and seeds nothing.
-	AuthToken = "token"
 	// AuthSharedHome bind-mounts one host directory as every container's agent
 	// profile. Nothing to re-seed and refreshes are shared, at the cost of
 	// concurrent sessions writing to the same config file.
@@ -111,16 +108,18 @@ func Load() (*Config, error) {
 	}
 
 	switch c.AuthMode {
-	case AuthToken:
-		if os.Getenv("CLAUDE_CODE_OAUTH_TOKEN") == "" {
-			return nil, errors.New("RV_AUTH_MODE=token requires CLAUDE_CODE_OAUTH_TOKEN " +
-				"(generate one with `claude setup-token`), or switch to RV_AUTH_MODE=seeded")
-		}
+	case "token":
+		// Removed rather than deprecated: a `claude setup-token` token carries
+		// no account record, and Remote Control stops and asks for a full
+		// browser login anyway — measured, not assumed.
+		return nil, errors.New("RV_AUTH_MODE=token is no longer supported: a setup-token " +
+			"does not satisfy Remote Control, which still asks for a browser sign-in. " +
+			"Set RV_AUTH_MODE=seeded and re-run `make auth`")
 	case AuthSeeded, AuthSharedHome:
 		// The directory is created on demand; bootstrap-auth.sh populates it.
 	default:
-		return nil, fmt.Errorf("RV_AUTH_MODE must be one of %q, %q, %q — got %q",
-			AuthSeeded, AuthToken, AuthSharedHome, c.AuthMode)
+		return nil, fmt.Errorf("RV_AUTH_MODE must be %q or %q — got %q",
+			AuthSeeded, AuthSharedHome, c.AuthMode)
 	}
 
 	// Forward the GitHub token to containers by name, not by value.
