@@ -22,21 +22,21 @@ reading carefully.
 
 ## Status
 
-Partly exercised. What has actually been run, on a laptop, against a public
-repo with a stub standing in for the agent: the image builds, the container
-clones and starts tmux, the daemon lists sessions from Docker labels, the logs
-endpoint returns both streams, killing the agent flips the session to *error*
-while leaving the container up for inspection, and a container restart resumes
-the same workspace and agent home.
+Working, with one path still untested. Confirmed on real hardware: a
+containerised `claude --remote-control` session **does** register and show up
+in the Claude iOS app, on a Pro subscription, with no API key involved.
 
-What has **not** been run: the VPS, Tailscale and systemd paths (documented,
-not tested), and the premise the whole thing rests on —
+Exercised locally: the image builds, the container clones and starts tmux, the
+daemon lists sessions from Docker labels, the logs endpoint returns both the
+startup output and the agent pane, a dead agent flips the session to *error*
+while leaving the container up, an agent stuck on a sign-in prompt is reported
+as such rather than as progress, and a restart resumes the same workspace and
+agent profile.
 
-> does a containerised `claude --remote-control` session appear in the iOS app,
-> under the credentials you gave it?
-
-`make verify` answers exactly that, in about a minute, without involving the
-daemon. Run it first.
+Not tested: the VPS, Tailscale and systemd paths, which are documented rather
+than run. After any change to authentication, `make verify` is the check —
+**run it twice**, since the second run is the one that proves a brand new
+session starts without a login prompt.
 
 ## Requirements
 
@@ -53,6 +53,7 @@ cp .env.example .env      # fill in RV_GITHUB_TOKEN
 make image                # build the session container
 make auth                 # sign in once (interactive)
 make verify               # check your phone — is the session listed?
+make verify               # again: a fresh profile must not ask you to log in
 make build && make run    # daemon on 127.0.0.1:8787
 ```
 
@@ -82,39 +83,52 @@ about. There is no OAuth device flow, on purpose — this is a single-user tool.
 ## Authentication
 
 The agent needs your Claude credentials inside the container, and Anthropic's
-sign-in is interactive. There is no way around a manual first step; the choice
-is *where the credential lives afterwards*.
+sign-in is interactive. A session you start from your phone has nobody at a
+keyboard to answer that prompt, so the whole question is how an
+**already-authenticated profile** reaches a brand new container.
 
-### `RV_AUTH_MODE=token` (default)
+One thing to know before choosing a mode: a login has two halves. The
+credentials live in `.credentials.json`, but the account record — which
+subscription, which user — lives in a *separate* file, `.claude.json`, that
+sits outside the credentials directory. Persist only the first and the agent
+asks you to sign in again, credentials or not. The image sets
+`CLAUDE_CONFIG_DIR` so both halves land in one directory, which is what makes
+any of this survive a restart.
 
-`make auth` runs `claude setup-token` and prints a long-lived token. Put it in
-your env file as `CLAUDE_CODE_OAUTH_TOKEN`; the daemon forwards it to every
-container.
+### `RV_AUTH_MODE=seeded` (default)
 
-- no shared credential file, so no refresh races between sessions
-- when the token expires, `make auth` again and restart the daemon
-- running sessions keep working on the credential they already have
+`make auth` signs you in once and leaves the profile on the host in
+`$RV_STATE_DIR/agent-home`. Every new session mounts that directory read-only
+and **copies** it into its own volume on first start.
+
+- one sign-in, ever; new repos start silently, which is what the phone flow needs
+- sessions keep their own credentials, conversation and project state
+- if a token refresh in a session makes the canonical copy stale, re-run
+  `make auth`
 
 ### `RV_AUTH_MODE=shared-home`
 
-`make auth` opens an interactive Claude session in a container whose `~/.claude`
-is bind-mounted from `$RV_STATE_DIR/agent-home`. You `/login` once; every
-session container mounts that directory *in place of* its per-session home.
+Every session mounts that same profile directly instead of copying it.
 
-- nothing to re-paste: Claude refreshes the credential in place
-- but all sessions share one config directory, so concurrent writes to
-  `.claude.json` and session history are possible. Fine for one person with a
-  couple of sessions; not something to lean on hard.
+- nothing to re-seed, and a refresh in one session benefits all of them
+- but concurrent sessions write to one config file and one session history
 
-Start with `token`. If Remote Control turns out not to register with a
-setup-token, switch to `shared-home` — `make verify` is how you find out, and
-switching is a one-line change plus a re-run of `make auth`.
+### `RV_AUTH_MODE=token`
+
+`make auth` runs `claude setup-token` and prints a long-lived token, forwarded
+to containers as `CLAUDE_CODE_OAUTH_TOKEN`, with no profile seeded.
+
+- nothing on disk to keep in sync
+- but a token carries no account record, so Remote Control may still stop and
+  ask you to sign in. Verify before relying on it.
 
 ### Refreshing
 
-Sessions fail with an auth error in the phone app when the credential lapses.
-Re-run `make auth`, restart the daemon, and stop/start the affected sessions.
-`GET /healthz` reports the configured mode.
+Sessions fail with an auth error in the phone app when the credential lapses,
+and a session that stalls on the sign-in prompt shows up as *error* with that
+reason rather than as a session your phone will never find. Re-run `make auth`,
+then stop and start the affected sessions. `GET /healthz` reports the
+configured mode.
 
 ## How it works
 
@@ -134,11 +148,18 @@ duplicate. (The slug flattens punctuation, so `owner/my.repo` and
 `owner/my-repo` would collide — rename one if you own both.)
 
 **Sessions survive restarts.** Each session gets two volumes: the checkout at
-`/workspace`, and the agent's own home at `/home/vibe/.claude`. The second one
-is what makes a reboot resume the conversation instead of quietly starting a
-blank session under the same name. Stopping a session keeps both, so restarting
-it picks up the same branch, the same uncommitted work and the same context;
-pass `?purge=1` to `DELETE` to throw all of it away.
+`/workspace`, and the agent's profile at `CLAUDE_CONFIG_DIR` — credentials,
+account record, conversation and all. The second one is what makes a reboot
+resume the session instead of quietly starting a blank one under the same name.
+Stopping a session keeps both, so restarting it picks up the same branch, the
+same uncommitted work and the same context; pass `?purge=1` to `DELETE` to
+throw all of it away.
+
+**A new session never asks you to log in.** On first start the entrypoint seeds
+the profile volume from the canonical one, and then watches the agent pane long
+enough to tell "registered for remote control" apart from "sitting on a sign-in
+prompt". The second is not progress, so it is reported as an error with the fix
+in the message, instead of a session the phone can never find.
 
 **Readiness is real.** The container's `HEALTHCHECK` reports healthy only while
 the agent process is actually alive in tmux, which is what the phone UI shows

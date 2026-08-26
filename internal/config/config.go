@@ -13,16 +13,33 @@ import (
 	"strings"
 )
 
-// Auth modes for the Claude agent inside the container.
+// Auth modes for the agent inside the container.
+//
+// All three exist because the sign-in is interactive and a session started
+// from a phone has nobody to answer it: the question each mode answers is how
+// an already-authenticated profile gets into a brand new container.
 const (
+	// AuthSeeded copies the canonical profile created by scripts/bootstrap-auth.sh
+	// into each session's own volume on first start. One sign-in ever, and
+	// sessions still own their credentials, conversation and project state
+	// separately afterwards.
+	AuthSeeded = "seeded"
 	// AuthToken forwards a long-lived OAuth token (from `claude setup-token`)
-	// as CLAUDE_CODE_OAUTH_TOKEN. Containers stay stateless.
+	// as CLAUDE_CODE_OAUTH_TOKEN and seeds nothing.
 	AuthToken = "token"
-	// AuthSharedHome bind-mounts a host directory as the agent's ~/.claude,
-	// shared by every session container. Credentials are created once by
-	// scripts/bootstrap-auth.sh and refreshed in place by Claude itself.
+	// AuthSharedHome bind-mounts one host directory as every container's agent
+	// profile. Nothing to re-seed and refreshes are shared, at the cost of
+	// concurrent sessions writing to the same config file.
 	AuthSharedHome = "shared-home"
 )
+
+// ConfigDir is where the image points CLAUDE_CONFIG_DIR: one directory holding
+// both the credentials and the account record, so a single volume carries a
+// usable login.
+const ConfigDir = "/home/vibe/.claude-state"
+
+// SeedDir is where the canonical profile is mounted, read-only, for seeding.
+const SeedDir = "/rv/auth"
 
 type Config struct {
 	Addr     string // listen address, fronted by `tailscale serve`
@@ -81,7 +98,7 @@ func Load() (*Config, error) {
 		Memory:          env("RV_MEMORY", ""),
 		GitHubToken:     env("RV_GITHUB_TOKEN", os.Getenv("GITHUB_TOKEN")),
 		GitHubUser:      env("RV_GITHUB_USER", ""),
-		AuthMode:        env("RV_AUTH_MODE", AuthToken),
+		AuthMode:        env("RV_AUTH_MODE", AuthSeeded),
 		PermissionMode:  env("RV_PERMISSION_MODE", "bypassPermissions"),
 		Model:           env("RV_MODEL", ""),
 		SessionPrefix:   env("RV_SESSION_PREFIX", ""),
@@ -97,12 +114,13 @@ func Load() (*Config, error) {
 	case AuthToken:
 		if os.Getenv("CLAUDE_CODE_OAUTH_TOKEN") == "" {
 			return nil, errors.New("RV_AUTH_MODE=token requires CLAUDE_CODE_OAUTH_TOKEN " +
-				"(generate one with `claude setup-token`), or switch to RV_AUTH_MODE=shared-home")
+				"(generate one with `claude setup-token`), or switch to RV_AUTH_MODE=seeded")
 		}
-	case AuthSharedHome:
+	case AuthSeeded, AuthSharedHome:
 		// The directory is created on demand; bootstrap-auth.sh populates it.
 	default:
-		return nil, fmt.Errorf("RV_AUTH_MODE must be %q or %q, got %q", AuthToken, AuthSharedHome, c.AuthMode)
+		return nil, fmt.Errorf("RV_AUTH_MODE must be one of %q, %q, %q — got %q",
+			AuthSeeded, AuthToken, AuthSharedHome, c.AuthMode)
 	}
 
 	// Forward the GitHub token to containers by name, not by value.
@@ -111,7 +129,8 @@ func Load() (*Config, error) {
 	return c, nil
 }
 
-// AgentHomeDir is the host path shared as ~/.claude in shared-home auth mode.
+// AgentHomeDir is the host path holding the canonical agent profile: the source
+// for seeding in seeded mode, and the live profile itself in shared-home mode.
 func (c *Config) AgentHomeDir() string {
 	return strings.TrimRight(c.StateDir, "/") + "/agent-home"
 }

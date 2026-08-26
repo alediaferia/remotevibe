@@ -278,15 +278,21 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		},
 		Volumes: []string{
 			s.volumeName(id) + ":/workspace",
-			s.homeVolume(id) + ":/home/vibe/.claude",
+			s.homeVolume(id) + ":" + config.ConfigDir,
 		},
 		CPUs:   s.cfg.CPUs,
 		Memory: s.cfg.Memory,
 	}
-	if s.cfg.AuthMode == config.AuthSharedHome {
-		// Shared credentials replace the per-session home entirely: one login,
-		// refreshed in place, at the cost of a shared config file.
-		spec.Volumes[1] = s.cfg.AgentHomeDir() + ":/home/vibe/.claude"
+	switch s.cfg.AuthMode {
+	case config.AuthSeeded:
+		// The canonical profile is mounted read-only and copied into the
+		// session's own volume on first start, so a new repo never lands on a
+		// sign-in prompt nobody is there to answer.
+		spec.Volumes = append(spec.Volumes, s.cfg.AgentHomeDir()+":"+config.SeedDir+":ro")
+	case config.AuthSharedHome:
+		// One profile for every session: nothing to seed, refreshes shared, and
+		// a config file they all write to.
+		spec.Volumes[1] = s.cfg.AgentHomeDir() + ":" + config.ConfigDir
 	}
 
 	if !s.docker.ImageExists(r.Context(), s.cfg.Image) {
@@ -398,12 +404,44 @@ func (s *Server) toSession(ct dockerx.Container) Session {
 	case ct.Health == "unhealthy":
 		sess.Status = "error"
 		if sess.Message == "" {
-			sess.Message = "the agent process is not running inside the container — check the logs"
+			sess.Message = s.unhealthyReason(ct.Name)
 		}
 	default:
-		sess.Status = "starting"
+		// Docker's health start period means a stuck container reports
+		// "starting" for minutes. A sign-in prompt is not progress, so surface
+		// it as soon as the entrypoint has had time to notice it.
+		if time.Since(ct.Started) > 20*time.Second && s.needsLogin(ct.Name) {
+			sess.Status = "error"
+			if sess.Message == "" {
+				sess.Message = needsLoginMsg
+			}
+		} else {
+			sess.Status = "starting"
+		}
 	}
 	return sess
+}
+
+const needsLoginMsg = "the agent is waiting for a sign-in — run `make auth` on the host, then start this session again"
+
+// needsLogin reports whether the container gave up on starting because the
+// agent asked to sign in. Nobody is at the keyboard of a container started from
+// a phone, so this never resolves on its own and should not be reported as
+// progress.
+func (s *Server) needsLogin(container string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := s.docker.Exec(ctx, container, "test", "-f", "/home/vibe/.remotevibe/needs-login")
+	return err == nil
+}
+
+// unhealthyReason distinguishes the two ways a session dies: the agent exited,
+// or it is stuck on a sign-in prompt.
+func (s *Server) unhealthyReason(container string) string {
+	if s.needsLogin(container) {
+		return needsLoginMsg
+	}
+	return "the agent process is not running inside the container — check the logs"
 }
 
 func (s *Server) setNote(id, msg string) {

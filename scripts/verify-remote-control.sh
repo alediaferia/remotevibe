@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Smoke test: does a containerised agent actually show up in the phone app?
+# Smoke test: does a containerised agent register for Remote Control *without
+# asking anyone to sign in*?
 #
-# Run this once after `make auth`, before trusting the daemon. It answers the
-# single question the whole design rests on — whether Remote Control registers
-# correctly with the credentials you chose — without involving the daemon, the
-# API, or GitHub.
+# Run it twice. The second run is the one that matters: it uses a fresh profile
+# volume, exactly like a container started from your phone for a repo you have
+# never opened before. If that run reaches the session without a login prompt,
+# the flow works.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -12,34 +13,45 @@ ENV_FILE="${RV_ENV_FILE:-.env}"
 [[ -f "$ENV_FILE" ]] && { set -a; . "$ENV_FILE"; set +a; }
 
 IMAGE="${RV_AGENT_IMAGE:-remotevibe/agent:latest}"
-MODE="${RV_AUTH_MODE:-token}"
+MODE="${RV_AUTH_MODE:-seeded}"
 STATE_DIR="${RV_STATE_DIR:-/var/lib/remotevibe}"
-NAME="rv-verify-$$"
+HOME_DIR="$STATE_DIR/agent-home"
+CONFIG_DIR=/home/vibe/.claude-state
 SESSION_NAME="${1:-remotevibe-check}"
+LAUNCH="claude --remote-control '$SESSION_NAME' --permission-mode ${RV_PERMISSION_MODE:-bypassPermissions}"
 
-args=(run --rm --name "$NAME" -it)
+args=(run --rm -it --name "rv-verify-$$")
 case "$MODE" in
+  seeded)
+    [[ -f "$HOME_DIR/.credentials.json" ]] || { echo "No profile in $HOME_DIR; run make auth" >&2; exit 1; }
+    # Mount the canonical profile read-only and copy it in, the way a real
+    # session container does — a bind mount would prove nothing about seeding.
+    args+=(-v "$HOME_DIR:/rv/auth:ro")
+    LAUNCH="cp -a /rv/auth/. $CONFIG_DIR/ && $LAUNCH"
+    ;;
   token)
     [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]] || { echo "CLAUDE_CODE_OAUTH_TOKEN is empty; run make auth" >&2; exit 1; }
     args+=(-e CLAUDE_CODE_OAUTH_TOKEN)
     ;;
   shared-home)
-    [[ -f "$STATE_DIR/agent-home/.credentials.json" ]] || { echo "No credentials in $STATE_DIR/agent-home; run make auth" >&2; exit 1; }
-    args+=(-v "$STATE_DIR/agent-home:/home/vibe/.claude")
+    [[ -f "$HOME_DIR/.credentials.json" ]] || { echo "No profile in $HOME_DIR; run make auth" >&2; exit 1; }
+    args+=(-v "$HOME_DIR:$CONFIG_DIR")
     ;;
 esac
 
 cat <<TXT
+Mode: $MODE
 Starting an interactive Claude session named "$SESSION_NAME" in a throwaway
-container. Now open the Claude app on your phone and look for it.
+container. Open the Claude app on your phone and look for it.
 
-  - it appears        -> your auth mode works; the daemon will work too
-  - it does not       -> try the other RV_AUTH_MODE and run this again
-  - login prompt      -> credentials did not reach the container
+  - it appears, no login asked -> the flow works; phone-started sessions will too
+  - it asks you to sign in      -> the profile is not reaching the container;
+                                   try RV_AUTH_MODE=seeded and re-run make auth
+  - nothing on the phone        -> it registered locally but did not publish;
+                                   check the session name in the app
 
 Ctrl-C twice to end the test.
 
 TXT
 
-exec docker "${args[@]}" --entrypoint bash "$IMAGE" \
-  -lc "claude --remote-control '$SESSION_NAME' --permission-mode ${RV_PERMISSION_MODE:-bypassPermissions}"
+exec docker "${args[@]}" --entrypoint bash "$IMAGE" -lc "$LAUNCH"

@@ -57,14 +57,18 @@ func main() {
 		log.Warn("agent image is missing; sessions will fail to start until it is built",
 			"image", cfg.Image, "fix", "make image")
 	}
-	if cfg.AuthMode == config.AuthSharedHome {
+	if cfg.AuthMode == config.AuthSeeded || cfg.AuthMode == config.AuthSharedHome {
 		if err := os.MkdirAll(cfg.AgentHomeDir(), 0o700); err != nil {
 			log.Error("cannot create agent home", "dir", cfg.AgentHomeDir(), "err", err)
 			os.Exit(2)
 		}
-		if _, err := os.Stat(cfg.AgentHomeDir() + "/.credentials.json"); err != nil {
-			log.Warn("no agent credentials found; run scripts/bootstrap-auth.sh once",
-				"dir", cfg.AgentHomeDir())
+		for _, f := range []string{".credentials.json", ".claude.json"} {
+			if _, err := os.Stat(cfg.AgentHomeDir() + "/" + f); err != nil {
+				// Both halves are needed: credentials alone leave the agent
+				// asking to sign in, which a phone-started session cannot answer.
+				log.Warn("agent profile is incomplete; sessions will stall on a sign-in prompt",
+					"dir", cfg.AgentHomeDir(), "missing", f, "fix", "make auth")
+			}
 		}
 	}
 

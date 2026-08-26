@@ -35,9 +35,14 @@ asks whether the tmux pane is running something other than a shell. Killing the
 stub is how you exercise the `error` path. Clean up test containers **and their
 volumes** afterwards — leftovers show up as real sessions in the API.
 
-## Unverified
+## Authentication, if you touch it
 
-`claude --remote-control` has never been confirmed to register from inside a
-container, under either auth mode. Do not write documentation or comments that
-assume it does; `scripts/verify-remote-control.sh` is the check, and it needs
-the maintainer's hardware and account.
+A Claude login is two files: `.credentials.json` and, separately,
+`.claude.json` (the account record). Persist only the first and the agent asks
+to sign in again — which a phone-started container cannot answer. The image
+sets `CLAUDE_CONFIG_DIR` so both land in one directory; keep them together.
+
+`scripts/verify-remote-control.sh` is the check, and it needs the maintainer's
+account. It has confirmed that a containerised `claude --remote-control`
+session registers and appears in the iOS app; what it must be re-run for, twice,
+is any change to how the profile reaches the container.

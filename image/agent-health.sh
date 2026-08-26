@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # Healthy means the agent is attachable *right now*.
 #
-# The check is "what is running in the foreground of the agent pane": if the
-# agent exited, the pane falls back to its shell, which is precisely the state
-# the phone must not be told is a live session. Matching on the process name
-# instead would depend on how the agent CLI was installed (a native binary, a
-# node wrapper, ...); matching on "not a shell" does not.
+# Two ways to fail. The pane may have fallen back to its shell, which means the
+# agent exited — matching on "not a shell" rather than on a process name keeps
+# this independent of how the agent CLI was installed. Or the agent may be
+# sitting on a sign-in prompt, which the entrypoint detects at startup and
+# records; nobody is at the keyboard of a phone-started container, so that is a
+# dead session however alive the process looks.
 set -euo pipefail
+
+STATE_DIR="$HOME/.remotevibe"
+[[ -f "$STATE_DIR/needs-login" ]] && exit 1
 
 tmux has-session -t agent 2>/dev/null || exit 1
 

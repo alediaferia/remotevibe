@@ -40,6 +40,15 @@ USER ${USERNAME}
 ENV HOME=/home/${USERNAME}
 ENV PATH=${HOME}/.local/bin:${PATH}
 
+# Keep the whole agent profile in one directory. By default Claude Code splits
+# it in two: credentials under ~/.claude, but the *account* record in the
+# sibling file ~/.claude.json. Persisting only the first leaves a container
+# with credentials it cannot use, and it asks you to sign in again — which is
+# fatal when the container was started from a phone. CLAUDE_CONFIG_DIR puts
+# both halves in one place, so one volume carries a working login.
+ENV CLAUDE_CONFIG_DIR=${HOME}/.claude-state
+RUN mkdir -p ${HOME}/.claude-state
+
 # Claude Code, installed as the unprivileged user so it self-updates in place.
 RUN curl -fsSL https://claude.ai/install.sh | bash \
     && claude --version
