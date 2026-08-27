@@ -10,6 +10,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 ENV_FILE="${RV_ENV_FILE:-.env}"
+# shellcheck source=/dev/null  # the env file is chosen at runtime, by design
 [[ -f "$ENV_FILE" ]] && { set -a; . "$ENV_FILE"; set +a; }
 
 IMAGE="${RV_AGENT_IMAGE:-remotevibe/agent:latest}"

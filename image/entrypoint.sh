@@ -79,11 +79,15 @@ CONFIG="$CONFIG_DIR/.claude.json"
 if command -v jq >/dev/null; then
   [[ -f "$CONFIG" ]] || echo '{}' > "$CONFIG"
   tmp="$(mktemp)"
-  jq --arg dir "$REPO_DIR" '
+  if jq --arg dir "$REPO_DIR" '
       .hasCompletedOnboarding = true
     | .bypassPermissionsModeAccepted = true
     | .projects = ((.projects // {}) * {($dir): (((.projects // {})[$dir]) // {} | .hasTrustDialogAccepted = true)})
-  ' "$CONFIG" > "$tmp" 2>/dev/null && mv "$tmp" "$CONFIG" || rm -f "$tmp"
+  ' "$CONFIG" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$CONFIG"
+  else
+    rm -f "$tmp"
+  fi
 fi
 
 # --- launch -----------------------------------------------------------------

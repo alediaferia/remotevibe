@@ -10,6 +10,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 ENV_FILE="${RV_ENV_FILE:-.env}"
+# shellcheck source=/dev/null  # the env file is chosen at runtime, by design
 [[ -f "$ENV_FILE" ]] && { set -a; . "$ENV_FILE"; set +a; }
 
 IMAGE="${RV_AGENT_IMAGE:-remotevibe/agent:latest}"
@@ -45,7 +46,7 @@ Sign in with /login, wait for it to confirm, then exit (Ctrl-C twice, or /exit).
 
 It starts in the same permission mode your sessions use, so any warning you
 accept here is recorded in the profile they are seeded from. Accepting it in a
-throwaway container — a `make verify` run, say — does not carry over.
+throwaway container — a "make verify" run, say — does not carry over.
 
 TXT
   docker run --rm -it --entrypoint bash \

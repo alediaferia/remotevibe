@@ -26,7 +26,8 @@ the Codex case specifically.
 ```bash
 make fmt vet test build
 make image
-shellcheck scripts/*.sh image/*.sh deploy/install.sh
+docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:stable \
+  scripts/*.sh image/*.sh deploy/install.sh   # no local install needed
 ```
 
 If you touch anything in the start path, say in the PR whether you actually ran
