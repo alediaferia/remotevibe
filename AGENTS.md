@@ -7,6 +7,9 @@ Orientation for coding agents. Read `README.md` for what this project is and
 
 - `go build ./...`, `go vet ./...`, `go test ./...`, `make image`. No external
   Go modules: `go.mod` has no `require` block, keep it that way.
+- Two images: `image/` is the session container, `deploy/Dockerfile` builds the
+  daemon for `docker compose` (`make up`). A new file under `cmd/`, `internal/`
+  or `web/` must be reachable from the `COPY` lines in `deploy/Dockerfile`.
 - **`web/` is embedded into the binary** (`web/embed.go`). Editing the PWA and
   reloading does nothing until you `make build` and restart the daemon.
 - New files in `web/` are invisible until added to the `//go:embed` list.

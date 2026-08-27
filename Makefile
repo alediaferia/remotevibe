@@ -2,7 +2,7 @@ BINARY  ?= bin/remotevibed
 IMAGE   ?= remotevibe/agent:latest
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
-.PHONY: help build image run check auth verify fmt vet test clean install
+.PHONY: help build image run check auth verify fmt vet test clean install up down logs
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "};{printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
@@ -12,6 +12,16 @@ build: ## Build the daemon
 
 image: ## Build the session container image
 	docker build -t $(IMAGE) image
+
+up: ## Build and start the daemon with docker compose
+	docker compose --profile build build agent
+	docker compose up -d --build
+
+down: ## Stop the daemon (running sessions are untouched)
+	docker compose down
+
+logs: ## Follow the daemon log
+	docker compose logs -f remotevibed
 
 run: build ## Run the daemon locally with .env loaded
 	set -a; . ./.env; set +a; $(BINARY)

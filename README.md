@@ -42,38 +42,79 @@ session starts without a login prompt.
 
 ## Requirements
 
-- A VPS on your tailnet, running Docker and Tailscale
+- A machine on your tailnet running Docker and Tailscale — a small VPS is fine
 - A Claude subscription (Pro or Max)
 - A fine-grained GitHub PAT
-- Go 1.24+ to build the daemon
+
+Nothing else: the daemon builds inside Docker, so the host needs no Go
+toolchain.
 
 ## Setup
 
+Everything below happens on the machine that will run the sessions. Put the
+checkout wherever you keep services — `/opt/remotevibe` is a reasonable
+default.
+
+**1. Configure**
+
 ```bash
-git clone https://github.com/alediaferia/remotevibe && cd remotevibe
-cp .env.example .env      # fill in RV_GITHUB_TOKEN
-make image                # build the session container
-make auth                 # sign in once (interactive)
-make verify               # check your phone — is the session listed?
-make verify               # again: a fresh profile must not ask you to log in
-make build && make run    # daemon on 127.0.0.1:8787
+git clone https://github.com/alediaferia/remotevibe /opt/remotevibe
+cd /opt/remotevibe && cp .env.example .env && chmod 600 .env
 ```
 
-Then put it on the tailnet:
+Edit `.env`: set `RV_GITHUB_TOKEN`, and set `RV_STATE_DIR` to a directory you
+own (`/opt/remotevibe/state`). Leave `RV_AUTH_MODE=seeded`. Consider
+`RV_SESSION_PREFIX=vps`, which is what makes sessions read as `vps/my-repo` in
+the phone app instead of blurring together with the ones on your laptop, and
+`RV_CPUS` / `RV_MEMORY`, so one session cannot take the box down.
+
+**2. Sign in once**
+
+```bash
+make image     # the session container
+make auth      # opens Claude in a container; use /login
+make verify    # look for the session in the Claude app on your phone
+make verify    # run it twice — a fresh profile must not ask you to log in
+```
+
+The second `make verify` is the one that matters: it starts from a blank
+profile, exactly like a session your phone kicks off for a repo you have never
+opened. If it reaches the session without prompting, the flow works. See
+[Authentication](#authentication) for why this dance exists.
+
+**3. Start the daemon**
+
+```bash
+make up        # docker compose up -d --build
+make logs      # follow it
+```
+
+Your user needs to be in the `docker` group: the daemon runs in a container
+with the Docker socket mounted, so it can start sessions as sibling containers.
+`RV_STATE_DIR` is mounted at the same path inside the container as outside —
+the daemon passes that path to the host's Docker when seeding a session, so it
+has to mean the same thing on both sides.
+
+**4. Put it on your tailnet**
 
 ```bash
 tailscale serve --bg 8787
 tailscale serve status     # the https URL to open on your phone
 ```
 
-Open that URL on the iPhone and add it to the home screen — it is a PWA, so it
-gets its own icon and no browser chrome.
+Open that URL in Safari on the iPhone and add it to the home screen — it is a
+PWA, so it gets its own icon and no browser chrome. The daemon publishes only
+to loopback; `tailscale serve` is what makes it reachable, and only from your
+tailnet.
 
-For a permanent install (systemd unit, service user, `/etc/remotevibe.env`):
+### Running it without compose
 
-```bash
-sudo ./deploy/install.sh
-```
+`make build && make run` runs the daemon straight from the checkout, which is
+the convenient shape for hacking on remotevibe itself. For a host-native
+service instead of a container, `deploy/` has a systemd unit and
+`deploy/install.sh`; it installs to `/usr/local/bin` with an
+`/etc/remotevibe.env` and a dedicated service user. Note that the interactive
+`make auth` then has to run as that same user, since it writes the profile.
 
 ### GitHub token
 
