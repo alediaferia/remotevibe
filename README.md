@@ -165,6 +165,26 @@ for a full browser sign-in with different scopes regardless. Setting
 `RV_AUTH_MODE=token` now fails at startup with that explanation rather than
 wasting your time.
 
+### If a session never appears on your phone
+
+Open the session's **Logs** — the agent pane is included, and it shows exactly
+what the session is sitting on. The two answers you are most likely to see:
+
+- *a sign-in prompt* — the profile did not reach the container; re-run
+  `make auth` and check `$RV_STATE_DIR/agent-home` holds both
+  `.credentials.json` and `.claude.json`
+- *a dialog awaiting a keypress* — one the pre-seeded profile did not cover.
+  You can unstick it by hand:
+
+```bash
+docker exec -it rv-<owner>-<repo> tmux attach -t agent
+```
+
+`make auth` runs in the same permission mode your sessions use, so any warning
+you accept during it is recorded in the profile they are seeded from. Accepting
+one inside a throwaway `make verify` container does **not** carry over — that
+container is deleted, and with it the copy of the profile you just changed.
+
 ### Refreshing
 
 Sessions fail with an auth error in the phone app when the credential lapses,
@@ -217,6 +237,15 @@ container is gone, left behind by a stop without a purge. Stopping a session
 offers both shapes: **Stop** keeps the checkout so the session resumes, **Stop
 & delete** reclaims it. Sizes come from one cached `docker system df -v` that
 refreshes off the request path, so a slow scan never stalls the session list.
+
+**A prompt is not progress.** The agent starts in an interactive TTY, and
+anything that stops for a keypress — sign-in, workspace trust, the
+bypass-permissions warning — looks exactly like a healthy process to anything
+watching from outside. The entrypoint therefore classifies startup from the
+pane and records one of three outcomes: registered, waiting for a sign-in, or
+never confirmed. The last two are reported as errors with the fix in the
+message, and the profile is pre-seeded to skip the known dialogs. If a session
+is rescued by hand, the supervisor notices and it goes back to *running*.
 
 **Logs show the part that matters.** The agent runs in a detached tmux pane, so
 nothing it prints reaches `docker logs` — including the auth error you are

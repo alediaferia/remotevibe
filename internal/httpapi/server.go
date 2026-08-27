@@ -575,38 +575,48 @@ func (s *Server) toSession(ct dockerx.Container, sizes map[string]int64, sizesKn
 		}
 	default:
 		// Docker's health start period means a stuck container reports
-		// "starting" for minutes. A sign-in prompt is not progress, so surface
-		// it as soon as the entrypoint has had time to notice it.
-		if time.Since(ct.Started) > 20*time.Second && s.needsLogin(ct.Name) {
-			sess.Status = "error"
-			if sess.Message == "" {
-				sess.Message = needsLoginMsg
+		// "starting" for minutes. A prompt waiting for a keypress is not
+		// progress, so surface it as soon as the entrypoint has noticed it.
+		if msg := ""; time.Since(ct.Started) > 20*time.Second {
+			if msg = s.stalled(ct.Name); msg != "" {
+				sess.Status = "error"
+				if sess.Message == "" {
+					sess.Message = msg
+				}
 			}
-		} else {
+		}
+		if sess.Status == "" {
 			sess.Status = "starting"
 		}
 	}
 	return sess
 }
 
-const needsLoginMsg = "the agent is waiting for a sign-in — run `make auth` on the host, then start this session again"
+const (
+	needsLoginMsg  = "the agent is waiting for a sign-in — run `make auth` on the host, then start this session again"
+	unconfirmedMsg = "the agent started but never confirmed Remote Control — it is probably waiting on a prompt; open the logs to see which"
+)
 
 // needsLogin reports whether the container gave up on starting because the
 // agent asked to sign in. Nobody is at the keyboard of a container started from
 // a phone, so this never resolves on its own and should not be reported as
 // progress.
-func (s *Server) needsLogin(container string) bool {
+func (s *Server) stalled(container string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err := s.docker.Exec(ctx, container, "test", "-f", "/home/vibe/.remotevibe/needs-login")
-	return err == nil
+	for marker, msg := range map[string]string{"needs-login": needsLoginMsg, "unconfirmed": unconfirmedMsg} {
+		if _, err := s.docker.Exec(ctx, container, "test", "-f", "/home/vibe/.remotevibe/"+marker); err == nil {
+			return msg
+		}
+	}
+	return ""
 }
 
 // unhealthyReason distinguishes the two ways a session dies: the agent exited,
 // or it is stuck on a sign-in prompt.
 func (s *Server) unhealthyReason(container string) string {
-	if s.needsLogin(container) {
-		return needsLoginMsg
+	if msg := s.stalled(container); msg != "" {
+		return msg
 	}
 	return "the agent process is not running inside the container — check the logs"
 }

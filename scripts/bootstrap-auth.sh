@@ -43,9 +43,14 @@ started from a phone.
 
 Sign in with /login, wait for it to confirm, then exit (Ctrl-C twice, or /exit).
 
+It starts in the same permission mode your sessions use, so any warning you
+accept here is recorded in the profile they are seeded from. Accepting it in a
+throwaway container — a `make verify` run, say — does not carry over.
+
 TXT
   docker run --rm -it --entrypoint bash \
-    -v "$HOME_DIR:$CONFIG_DIR" "$IMAGE" -lc 'claude'
+    -v "$HOME_DIR:$CONFIG_DIR" "$IMAGE" \
+    -lc "claude --permission-mode ${RV_PERMISSION_MODE:-bypassPermissions}"
 
   if [[ -f "$HOME_DIR/.credentials.json" && -f "$HOME_DIR/.claude.json" ]]; then
     echo "Agent profile stored in $HOME_DIR"
