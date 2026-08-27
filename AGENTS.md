@@ -50,7 +50,6 @@ not satisfy Remote Control, which asks for a browser sign-in anyway. The daemon
 neither accepts a `token` auth mode nor forwards that variable into containers,
 because an env token shadows a working profile. Do not reintroduce either.
 
-`scripts/verify-remote-control.sh` is the check, and it needs the maintainer's
-account. It has confirmed that a containerised `claude --remote-control`
-session registers and appears in the iOS app; what it must be re-run for, twice,
-is any change to how the profile reaches the container.
+`scripts/verify-remote-control.sh` is the check, and it needs a real account.
+Re-run it — twice, since the second run is the one starting from a blank
+profile — after any change to how the profile reaches the container.

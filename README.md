@@ -20,25 +20,9 @@ way it does on your laptop. That sign-in is interactive and occasional — see
 [Authentication](#authentication), which is the part of this project worth
 reading carefully.
 
-## Status
-
-Working, with one path still untested. Confirmed on real hardware: a
-containerised `claude --remote-control` session **does** register and show up
-in the Claude iOS app, on a Pro subscription, with no API key involved — given
-a profile that is already signed in, which is what `seeded` mode exists to
-provide.
-
-Exercised locally: the image builds, the container clones and starts tmux, the
-daemon lists sessions from Docker labels, the logs endpoint returns both the
-startup output and the agent pane, a dead agent flips the session to *error*
-while leaving the container up, an agent stuck on a sign-in prompt is reported
-as such rather than as progress, and a restart resumes the same workspace and
-agent profile.
-
-Not tested: the VPS, Tailscale and systemd paths, which are documented rather
-than run. After any change to authentication, `make verify` is the check —
-**run it twice**, since the second run is the one that proves a brand new
-session starts without a login prompt.
+Sessions are long-lived: they survive the daemon restarting, keep their
+checkout and their conversation across a container restart, and show up as
+*error* with a reason — not a phantom "running" — when something goes wrong.
 
 ## Requirements
 
@@ -67,6 +51,11 @@ own (`/opt/remotevibe/state`). Leave `RV_AUTH_MODE=seeded`. Consider
 `RV_SESSION_PREFIX=vps`, which is what makes sessions read as `vps/my-repo` in
 the phone app instead of blurring together with the ones on your laptop, and
 `RV_CPUS` / `RV_MEMORY`, so one session cannot take the box down.
+
+Each `make` target is a one-line wrapper — `make image` is `docker build`,
+`make auth` is `./scripts/bootstrap-auth.sh`, `make up` is
+`docker compose up -d --build` — so a host without `make` can run the commands
+directly.
 
 **2. Sign in once**
 
@@ -102,6 +91,11 @@ tailscale serve --bg 8787
 tailscale serve status     # the https URL to open on your phone
 ```
 
+If that host already serves something on 443, put remotevibe on another HTTPS
+port instead — `tailscale serve --bg --https=8443 8787`. Tailscale allows 443,
+8443 and 10000. Do not use `--set-path`: the PWA fetches from absolute paths
+and will not work under a subpath.
+
 Open that URL in Safari on the iPhone and add it to the home screen — it is a
 PWA, so it gets its own icon and no browser chrome. The daemon publishes only
 to loopback; `tailscale serve` is what makes it reachable, and only from your
@@ -110,11 +104,14 @@ tailnet.
 ### Running it without compose
 
 `make build && make run` runs the daemon straight from the checkout, which is
-the convenient shape for hacking on remotevibe itself. For a host-native
-service instead of a container, `deploy/` has a systemd unit and
-`deploy/install.sh`; it installs to `/usr/local/bin` with an
-`/etc/remotevibe.env` and a dedicated service user. Note that the interactive
-`make auth` then has to run as that same user, since it writes the profile.
+the convenient shape for hacking on remotevibe itself.
+
+For a host-native service instead of a container, `deploy/` has a systemd unit
+and `deploy/install.sh`, which installs to `/usr/local/bin` with an
+`/etc/remotevibe.env` and a dedicated service user. Compose is the path that
+gets exercised, so prefer it unless you have a reason not to; with the systemd
+route, remember that the interactive `make auth` has to run as the service user,
+since it writes the profile that user reads.
 
 ### GitHub token
 
@@ -218,11 +215,9 @@ Stopping a session keeps both, so restarting it picks up the same branch, the
 same uncommitted work and the same context; pass `?purge=1` to `DELETE` to
 throw all of it away.
 
-**A new session never asks you to log in.** On first start the entrypoint seeds
-the profile volume from the canonical one, and then watches the agent pane long
-enough to tell "registered for remote control" apart from "sitting on a sign-in
-prompt". The second is not progress, so it is reported as an error with the fix
-in the message, instead of a session the phone can never find.
+**A new session never asks you to log in.** On first start the entrypoint
+copies the canonical profile into the session's own volume, so a repo you have
+never opened starts already authenticated.
 
 **Readiness is real.** The container's `HEALTHCHECK` reports healthy only while
 the agent process is actually alive in tmux, which is what the phone UI shows

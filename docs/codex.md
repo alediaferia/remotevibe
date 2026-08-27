@@ -9,7 +9,7 @@ remotevibe's flow depends on one specific capability:
 For Claude Code this is `claude --remote-control <name>`, and everything in
 this repository is built around it.
 
-## Status: unverified
+## Status: not implemented
 
 Whether the Codex CLI exposes an equivalent has **not** been confirmed, and
 this repository deliberately does not guess. Codex's published remote story is
