@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -244,4 +245,107 @@ func (c *Client) PaneLogs(ctx context.Context, name string, lines int) (string, 
 func (c *Client) Exec(ctx context.Context, name string, argv ...string) (string, error) {
 	args := append([]string{"exec", name}, argv...)
 	return c.run(ctx, args...)
+}
+
+// dfPayload is the shape of `docker system df -v --format '{{json .}}'`: one
+// JSON object (not one-per-line) with an array per resource kind. Only
+// Volumes matters here.
+type dfPayload struct {
+	Volumes []struct {
+		Name string `json:"Name"`
+		Size string `json:"Size"` // human-readable, e.g. "52.32MB", "0B"
+	} `json:"Volumes"`
+}
+
+// VolumeSizes returns the on-disk size, in bytes, of every Docker volume —
+// not just remotevibe's — as reported by `docker system df -v`. That command
+// is the only way to get a volume's size short of walking its mountpoint as
+// root, but it also scans every volume and image on the host, so callers
+// should cache the result rather than call this per request.
+func (c *Client) VolumeSizes(ctx context.Context) (map[string]int64, error) {
+	out, err := c.run(ctx, "system", "df", "-v", "--format", "{{json .}}")
+	if err != nil {
+		return nil, err
+	}
+	var payload dfPayload
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		return nil, fmt.Errorf("parse docker system df -v: %w", err)
+	}
+	sizes := make(map[string]int64, len(payload.Volumes))
+	for _, v := range payload.Volumes {
+		b, err := parseHumanSize(v.Size)
+		if err != nil {
+			continue // one unparseable entry shouldn't sink the whole lookup
+		}
+		sizes[v.Name] = b
+	}
+	return sizes, nil
+}
+
+// humanSizeUnits mirrors the decimal (1000-based) suffixes Docker's CLI uses
+// when formatting volume sizes — "MB" not "MiB". Longest suffixes are matched
+// first so "kB" doesn't get shadowed by a stray "B" check.
+var humanSizeUnits = []struct {
+	suffix string
+	factor float64
+}{
+	{"PB", 1e15},
+	{"TB", 1e12},
+	{"GB", 1e9},
+	{"MB", 1e6},
+	{"kB", 1e3},
+	{"B", 1},
+}
+
+// parseHumanSize converts a Docker-formatted size like "52.32MB" or "0B"
+// into bytes.
+func parseHumanSize(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	for _, u := range humanSizeUnits {
+		if strings.HasSuffix(s, u.suffix) {
+			numStr := strings.TrimSuffix(s, u.suffix)
+			n, err := strconv.ParseFloat(numStr, 64)
+			if err != nil {
+				return 0, fmt.Errorf("parse size %q: %w", s, err)
+			}
+			return int64(n * u.factor), nil
+		}
+	}
+	return 0, fmt.Errorf("unrecognized size format %q", s)
+}
+
+// VolumeNames lists every Docker volume whose name starts with one of the
+// given prefixes. Filtering client-side (rather than with `docker volume ls
+// --filter`) keeps the prefix logic in one place and matches VolumeSizes'
+// naming, which does no filtering of its own.
+func (c *Client) VolumeNames(ctx context.Context, prefixes ...string) ([]string, error) {
+	out, err := c.run(ctx, "volume", "ls", "--format", "{{.Name}}")
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		for _, p := range prefixes {
+			if strings.HasPrefix(line, p) {
+				names = append(names, line)
+				break
+			}
+		}
+	}
+	return names, nil
+}
+
+// RemoveVolume deletes a single named volume. Used to reclaim orphaned
+// volumes whose container was already removed without the purge flag.
+// Removing an already-gone volume is treated as success, so callers can
+// retry a delete without an extra existence check.
+func (c *Client) RemoveVolume(ctx context.Context, name string) error {
+	if _, err := c.run(ctx, "volume", "rm", name); err != nil && !strings.Contains(err.Error(), "No such") {
+		return err
+	}
+	return nil
 }

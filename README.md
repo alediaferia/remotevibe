@@ -210,6 +210,14 @@ as *starting → running*. It is a liveness check, not a one-time flag: if the
 agent dies, the session goes back to *error* rather than lying about being
 attachable.
 
+**Disk is visible, because keeping volumes is the default.** Every session card
+shows what its checkout and profile occupy. A *Storage* panel adds the totals
+and — the part the session list structurally cannot show — volumes whose
+container is gone, left behind by a stop without a purge. Stopping a session
+offers both shapes: **Stop** keeps the checkout so the session resumes, **Stop
+& delete** reclaims it. Sizes come from one cached `docker system df -v` that
+refreshes off the request path, so a slow scan never stalls the session list.
+
 **Logs show the part that matters.** The agent runs in a detached tmux pane, so
 nothing it prints reaches `docker logs` — including the auth error you are
 looking for. `/api/sessions/{id}/logs` returns the container startup output
@@ -262,7 +270,9 @@ container, not the user inside it. CPU and memory caps come from `RV_CPUS` and
 | `GET` | `/api/agents` | drivers and whether each is usable |
 | `GET` | `/api/sessions` | live sessions, derived from Docker |
 | `POST` | `/api/sessions` | `{"repo":"owner/name","branch":"main","agent":"claude"}` |
-| `DELETE` | `/api/sessions/{id}?purge=1` | stop; `purge` also drops the workspace |
+| `DELETE` | `/api/sessions/{id}?purge=1` | stop; `purge` also drops the volumes |
+| `GET` | `/api/storage` | total and reclaimable bytes, plus orphaned volumes |
+| `DELETE` | `/api/volumes/{name}` | delete one orphaned `rv-ws-*` / `rv-home-*` volume |
 | `GET` | `/api/sessions/{id}/logs?tail=200` | startup log + agent tmux pane, text/plain |
 | `GET` | `/healthz` | docker reachable, image present, auth mode |
 

@@ -64,6 +64,45 @@
       </div>
     </section>
 
+    <!-- ================= Storage ================= -->
+    <section class="section" aria-labelledby="storage-heading">
+      <button id="storage-toggle" class="storage-toggle" aria-expanded="false" aria-controls="storage-body">
+        <span class="section-head" style="margin-bottom: 0;">
+          <h2 id="storage-heading">Storage</h2>
+          <svg id="storage-chevron" class="storage-chevron" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+            <path d="M9 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </span>
+      </button>
+
+      <div id="storage-body" class="storage-body" hidden>
+        <div id="storage-loading" class="empty-state">
+          <p>Loading storage&hellip;</p>
+        </div>
+
+        <div id="storage-content" class="storage-content" hidden>
+          <div class="storage-summary">
+            <div class="storage-stat">
+              <div class="storage-stat-value" id="storage-total">&mdash;</div>
+              <div class="storage-stat-label">total used</div>
+            </div>
+            <div class="storage-stat">
+              <div class="storage-stat-value" id="storage-reclaimable">&mdash;</div>
+              <div class="storage-stat-label">reclaimable</div>
+            </div>
+          </div>
+
+          <div id="storage-orphans-list" class="storage-orphans-list"></div>
+
+          <div id="storage-orphans-empty" class="empty-state" hidden>
+            <div class="empty-state-icon" aria-hidden="true">&#10003;</div>
+            <p>No orphaned volumes.</p>
+            <p class="empty-state-sub">Nothing to reclaim right now.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <!-- ================= Start a session ================= -->
     <section class="section" aria-labelledby="start-heading">
       <div class="section-head">

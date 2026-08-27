@@ -30,10 +30,15 @@
     // is always replaced rather than treated as already-connected.
     lastPollFailed: null,
     activeStopConfirm: null, // session id currently in "confirm stop" state
+    activePurgeConfirm: null, // session id currently in "confirm stop & delete" state
     startSheetRepo: null,    // repo object the start sheet is open for
     startSheetAgent: "claude",
     starting: false,
     logsSessionId: null,
+    storageOpen: false,
+    storageLoaded: false,
+    storageOrphans: [],
+    activeVolumeConfirm: null, // volume name currently in "confirm delete" state
   };
 
   /* ------------------------------------------------------------------ *
@@ -77,6 +82,16 @@
     logsSheetClose: document.getElementById("logs-sheet-close"),
     logsRefresh: document.getElementById("logs-refresh"),
     logsContent: document.getElementById("logs-content"),
+
+    storageToggle: document.getElementById("storage-toggle"),
+    storageChevron: document.getElementById("storage-chevron"),
+    storageBody: document.getElementById("storage-body"),
+    storageLoading: document.getElementById("storage-loading"),
+    storageContent: document.getElementById("storage-content"),
+    storageTotal: document.getElementById("storage-total"),
+    storageReclaimable: document.getElementById("storage-reclaimable"),
+    storageOrphansList: document.getElementById("storage-orphans-list"),
+    storageOrphansEmpty: document.getElementById("storage-orphans-empty"),
   };
 
   /* ------------------------------------------------------------------ *
@@ -115,11 +130,28 @@
       return { session: data.session, alreadyExisted: false };
     },
 
-    async deleteSession(id) {
-      const res = await apiFetch(`/api/sessions/${encodeURIComponent(id)}`, { method: "DELETE" });
+    async deleteSession(id, { purge } = {}) {
+      const url = new URL(`/api/sessions/${encodeURIComponent(id)}`, window.location.origin);
+      if (purge) url.searchParams.set("purge", "1");
+      const res = await apiFetch(url.toString(), { method: "DELETE" });
       if (!res.ok && res.status !== 204) {
         const data = await parseJson(res).catch(() => ({}));
         throw new ApiError(data.error || "Failed to stop session", res.status);
+      }
+    },
+
+    async getStorage() {
+      const res = await apiFetch("/api/storage");
+      const data = await parseJson(res);
+      if (!res.ok) throw new ApiError(data.error || "Failed to load storage", res.status);
+      return data;
+    },
+
+    async deleteVolume(name) {
+      const res = await apiFetch(`/api/volumes/${encodeURIComponent(name)}`, { method: "DELETE" });
+      if (!res.ok && res.status !== 204) {
+        const data = await parseJson(res).catch(() => ({}));
+        throw new ApiError(data.error || "Failed to delete volume", res.status);
       }
     },
 
@@ -181,6 +213,21 @@
     if (diffDay < 30) return `${diffDay}d ago`;
     const diffMonth = Math.round(diffDay / 30);
     return `${diffMonth}mo ago`;
+  }
+
+  /** Formats bytes as Docker itself does — decimal units, ~3 significant digits. */
+  function formatBytes(bytes) {
+    if (!Number.isFinite(bytes) || bytes < 0) return "—";
+    if (bytes === 0) return "0 B";
+    const units = ["B", "kB", "MB", "GB", "TB", "PB"];
+    let n = bytes;
+    let i = 0;
+    while (n >= 1000 && i < units.length - 1) {
+      n /= 1000;
+      i++;
+    }
+    const digits = i === 0 ? 0 : n < 10 ? 1 : 0;
+    return `${n.toFixed(digits)} ${units[i]}`;
   }
 
   function escapeHtml(str) {
@@ -247,7 +294,9 @@
     card.dataset.id = session.id;
 
     const status = STATUS_LABEL[session.status] || session.status;
-    const confirming = state.activeStopConfirm === session.id;
+    const confirmingStop = state.activeStopConfirm === session.id;
+    const confirmingPurge = state.activePurgeConfirm === session.id;
+    const diskLabel = session.disk_known ? formatBytes(session.disk_bytes) : "—";
 
     card.innerHTML = `
       <div class="session-card-top">
@@ -257,6 +306,7 @@
             <span>${escapeHtml(session.branch || "—")}</span>
             <span class="dot">${escapeHtml(session.agent || "claude")}</span>
             <span class="dot">${relativeTime(session.created_at)}</span>
+            <span class="dot">${escapeHtml(diskLabel)}</span>
           </div>
         </div>
         <span class="status-pill status-${escapeHtml(session.status)}">${escapeHtml(status)}</span>
@@ -264,14 +314,18 @@
       ${session.message ? `<div class="session-message">${escapeHtml(session.message)}</div>` : ""}
       <div class="session-actions">
         <button type="button" class="btn" data-action="logs">Logs</button>
-        <button type="button" class="btn ${confirming ? "btn-danger-confirm" : ""}" data-action="stop">
-          ${confirming ? "Tap again to stop" : "Stop"}
+        <button type="button" class="btn ${confirmingStop ? "btn-danger-confirm" : ""}" data-action="stop">
+          ${confirmingStop ? "Tap again to stop" : "Stop"}
+        </button>
+        <button type="button" class="btn btn-danger ${confirmingPurge ? "btn-danger-confirm" : ""}" data-action="purge">
+          ${confirmingPurge ? "Deletes checkout too" : "Stop & delete"}
         </button>
       </div>
     `;
 
     card.querySelector('[data-action="logs"]').addEventListener("click", () => openLogsSheet(session.id, session.repo));
     card.querySelector('[data-action="stop"]').addEventListener("click", () => handleStopClick(session.id));
+    card.querySelector('[data-action="purge"]').addEventListener("click", () => handlePurgeClick(session.id));
 
     return card;
   }
@@ -313,7 +367,10 @@
     refreshSessions({ silent: true }).then(schedulePoll);
   });
 
-  el.sessionsRefresh.addEventListener("click", () => refreshSessions());
+  el.sessionsRefresh.addEventListener("click", () => {
+    refreshSessions();
+    if (state.storageOpen) loadStorage();
+  });
 
   /* ------------------------------------------------------------------ *
    * 7. Session actions: stop, logs
@@ -326,6 +383,7 @@
       return;
     }
     state.activeStopConfirm = id;
+    state.activePurgeConfirm = null;
     renderSessions();
     // Auto-revert the confirm state after a few seconds so it doesn't linger.
     setTimeout(() => {
@@ -344,6 +402,32 @@
       await refreshSessions();
     } catch (err) {
       showBanner(err.message || "Failed to stop session");
+    }
+  }
+
+  function handlePurgeClick(id) {
+    if (state.activePurgeConfirm === id) {
+      state.activePurgeConfirm = null;
+      doPurgeSession(id);
+      return;
+    }
+    state.activePurgeConfirm = id;
+    state.activeStopConfirm = null;
+    renderSessions();
+    setTimeout(() => {
+      if (state.activePurgeConfirm === id) {
+        state.activePurgeConfirm = null;
+        renderSessions();
+      }
+    }, 4000);
+  }
+
+  async function doPurgeSession(id) {
+    try {
+      await api.deleteSession(id, { purge: true });
+      await refreshSessions();
+    } catch (err) {
+      showBanner(err.message || "Failed to stop and delete session");
     }
   }
 
@@ -376,6 +460,100 @@
     if (e.target === el.logsSheetBackdrop) closeLogsSheet();
   });
   el.logsRefresh.addEventListener("click", loadLogs);
+
+  /* ------------------------------------------------------------------ *
+   * 7b. Storage
+   * ------------------------------------------------------------------ */
+
+  function renderOrphans(orphans) {
+    el.storageOrphansList.innerHTML = "";
+
+    if (orphans.length === 0) {
+      el.storageOrphansEmpty.hidden = false;
+      el.storageOrphansList.hidden = true;
+      return;
+    }
+    el.storageOrphansEmpty.hidden = true;
+    el.storageOrphansList.hidden = false;
+
+    for (const orphan of orphans) {
+      el.storageOrphansList.appendChild(buildOrphanRow(orphan));
+    }
+  }
+
+  function buildOrphanRow(orphan) {
+    const row = document.createElement("div");
+    row.className = "storage-orphan-row";
+    const confirming = state.activeVolumeConfirm === orphan.volume;
+
+    row.innerHTML = `
+      <div class="storage-orphan-main">
+        <div class="storage-orphan-name">${escapeHtml(orphan.volume)}</div>
+        <div class="storage-orphan-meta">${escapeHtml(orphan.kind)} &middot; ${escapeHtml(orphan.sizeKnown === false ? "—" : formatBytes(orphan.bytes))}</div>
+      </div>
+      <button type="button" class="btn btn-danger ${confirming ? "btn-danger-confirm" : ""}" data-action="delete-volume">
+        ${confirming ? "Confirm" : "Delete"}
+      </button>
+    `;
+
+    row.querySelector('[data-action="delete-volume"]').addEventListener("click", () => handleVolumeDeleteClick(orphan.volume));
+    return row;
+  }
+
+  function handleVolumeDeleteClick(name) {
+    if (state.activeVolumeConfirm === name) {
+      state.activeVolumeConfirm = null;
+      doDeleteVolume(name);
+      return;
+    }
+    state.activeVolumeConfirm = name;
+    renderOrphans(state.storageOrphans || []);
+    setTimeout(() => {
+      if (state.activeVolumeConfirm === name) {
+        state.activeVolumeConfirm = null;
+        renderOrphans(state.storageOrphans || []);
+      }
+    }, 4000);
+  }
+
+  async function doDeleteVolume(name) {
+    try {
+      await api.deleteVolume(name);
+      await loadStorage();
+    } catch (err) {
+      showBanner(err.message || "Failed to delete volume");
+    }
+  }
+
+  async function loadStorage() {
+    el.storageLoading.hidden = false;
+    el.storageContent.hidden = true;
+    try {
+      const data = await api.getStorage();
+      state.storageOrphans = (data.orphans || []).map((o) => ({ ...o, sizeKnown: data.sizes_known !== false }));
+      // sizes_known is false until the daemon's first size lookup lands; show
+      // a dash rather than a confident zero.
+      const known = data.sizes_known !== false;
+      el.storageTotal.textContent = known ? formatBytes(data.total_bytes || 0) : "—";
+      el.storageReclaimable.textContent = known ? formatBytes(data.reclaimable_bytes || 0) : "—";
+      renderOrphans(state.storageOrphans);
+      el.storageLoading.hidden = true;
+      el.storageContent.hidden = false;
+      state.storageLoaded = true;
+    } catch (err) {
+      el.storageLoading.hidden = true;
+      showBanner(err.message || "Failed to load storage");
+    }
+  }
+
+  function setStorageOpen(isOpen) {
+    state.storageOpen = isOpen;
+    el.storageToggle.setAttribute("aria-expanded", String(isOpen));
+    el.storageBody.hidden = !isOpen;
+    if (isOpen && !state.storageLoaded) loadStorage();
+  }
+
+  el.storageToggle.addEventListener("click", () => setStorageOpen(!state.storageOpen));
 
   /* ------------------------------------------------------------------ *
    * 8. Repos: search + render

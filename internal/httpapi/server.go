@@ -35,6 +35,8 @@ type Session struct {
 	Container string    `json:"container"`
 	CreatedAt time.Time `json:"created_at"`
 	Message   string    `json:"message,omitempty"`
+	DiskBytes int64     `json:"disk_bytes"`
+	DiskKnown bool      `json:"disk_known"` // false when the size lookup failed or hasn't run yet
 }
 
 type Server struct {
@@ -47,7 +49,17 @@ type Server struct {
 	mu    sync.Mutex
 	notes map[string]string // sessionID -> last failure message
 	busy  map[string]bool   // sessionIDs with a start in flight
+
+	diskMu         sync.Mutex
+	diskAt         time.Time
+	diskSizes      map[string]int64
+	diskErr        error
+	diskRefreshing bool
 }
+
+// diskCacheTTL bounds how often `docker system df -v` runs: it scans every
+// volume and image on the host, and the UI polls sessions every 5s.
+const diskCacheTTL = 60 * time.Second
 
 func New(cfg *config.Config, docker *dockerx.Client, gh *ghclient.Client, web fs.FS, log *slog.Logger) *Server {
 	return &Server{cfg: cfg, docker: docker, gh: gh, web: web, log: log,
@@ -63,6 +75,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/sessions", s.handleCreateSession)
 	mux.HandleFunc("DELETE /api/sessions/{id}", s.handleDeleteSession)
 	mux.HandleFunc("GET /api/sessions/{id}/logs", s.handleLogs)
+	mux.HandleFunc("GET /api/storage", s.handleStorage)
+	mux.HandleFunc("DELETE /api/volumes/{name}", s.handleDeleteVolume)
 	mux.Handle("/", http.FileServer(http.FS(s.web)))
 	return mux
 }
@@ -233,7 +247,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		if existing.State == "running" {
 			writeJSON(w, http.StatusConflict, map[string]any{
 				"error":   "a session for this repository is already running",
-				"session": s.toSession(*existing),
+				"session": s.toSession(*existing, nil, false),
 			})
 			return
 		}
@@ -317,7 +331,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		}})
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"session": s.toSession(*ct)})
+	writeJSON(w, http.StatusCreated, map[string]any{"session": s.toSession(*ct, nil, false)})
 }
 
 func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
@@ -363,6 +377,154 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(b.String()))
 }
 
+// --- storage -----------------------------------------------------------
+
+// volumeSizes returns the cached volume-size map, refreshing it from Docker
+// once diskCacheTTL has elapsed. The second return value is false when the
+// underlying `docker system df -v` call failed or has never succeeded, so
+// callers can distinguish "genuinely empty" from "unknown".
+func (s *Server) volumeSizes(ctx context.Context) (map[string]int64, bool) {
+	s.diskMu.Lock()
+	sizes, known := s.diskSizes, s.diskSizes != nil
+	stale := time.Since(s.diskAt) >= diskCacheTTL
+	first := !known && !s.diskRefreshing
+	if stale && !s.diskRefreshing {
+		s.diskRefreshing = true
+		// `docker system df -v` walks every volume and image on the host and
+		// can take seconds. Refresh it off the request path and keep serving
+		// the previous answer: a size a minute out of date is fine, a session
+		// list that stalls behind Docker is not.
+		go s.refreshVolumeSizes()
+	}
+	s.diskMu.Unlock()
+
+	if first {
+		// Nothing cached yet and a refresh has only just been kicked off; the
+		// caller reports sizes as unknown until it lands.
+		return nil, false
+	}
+	return sizes, known
+}
+
+func (s *Server) refreshVolumeSizes() {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	sizes, err := s.docker.VolumeSizes(ctx)
+
+	s.diskMu.Lock()
+	defer s.diskMu.Unlock()
+	s.diskRefreshing = false
+	if err != nil {
+		// Keep serving a stale-but-known map rather than flipping every
+		// session to "unknown" because of one failed lookup.
+		s.diskErr = err
+		s.log.Warn("could not read volume sizes", "err", err)
+		return
+	}
+	s.diskAt, s.diskSizes, s.diskErr = time.Now(), sizes, nil
+}
+
+// volumeKind classifies a remotevibe volume name and returns the session id
+// it belongs to. ok is false for a name matching neither prefix.
+func (s *Server) volumeKind(name string) (id, kind string, ok bool) {
+	switch {
+	case strings.HasPrefix(name, s.cfg.WorkspacePrefix):
+		return strings.TrimPrefix(name, s.cfg.WorkspacePrefix), "workspace", true
+	case strings.HasPrefix(name, s.cfg.HomePrefix):
+		return strings.TrimPrefix(name, s.cfg.HomePrefix), "profile", true
+	default:
+		return "", "", false
+	}
+}
+
+type storageOrphan struct {
+	Volume string `json:"volume"`
+	Bytes  int64  `json:"bytes"`
+	Kind   string `json:"kind"`
+}
+
+func (s *Server) handleStorage(w http.ResponseWriter, r *http.Request) {
+	containers, err := s.docker.List(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err)
+		return
+	}
+	running := map[string]bool{} // session id -> container is running
+	exists := map[string]bool{}  // session id -> container exists at all
+	for _, ct := range containers {
+		id := strings.TrimPrefix(ct.Name, s.cfg.ContainerName)
+		exists[id] = true
+		if ct.State == "running" {
+			running[id] = true
+		}
+	}
+
+	names, err := s.docker.VolumeNames(r.Context(), s.cfg.WorkspacePrefix, s.cfg.HomePrefix)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err)
+		return
+	}
+	sizes, sizesKnown := s.volumeSizes(r.Context())
+
+	var total, reclaimable int64
+	orphans := []storageOrphan{}
+	for _, name := range names {
+		b := sizes[name]
+		total += b
+		id, kind, ok := s.volumeKind(name)
+		if !ok {
+			continue
+		}
+		switch {
+		case !exists[id]:
+			orphans = append(orphans, storageOrphan{Volume: name, Bytes: b, Kind: kind})
+			reclaimable += b
+		case !running[id]:
+			// Belongs to a stopped-but-resumable session: not an orphan, but
+			// still space that could be reclaimed by purging that session.
+			reclaimable += b
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"total_bytes":       total,
+		"reclaimable_bytes": reclaimable,
+		// Sizes arrive a moment after the first request, once the background
+		// lookup lands. Say so, rather than letting the UI report a confident
+		// "0 B" for volumes it has simply not measured yet.
+		"sizes_known": sizesKnown,
+		"orphans":     orphans,
+	})
+}
+
+func (s *Server) handleDeleteVolume(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	id, _, ok := s.volumeKind(name)
+	if !ok {
+		writeErr(w, http.StatusBadRequest,
+			fmt.Errorf("refusing to delete %q: not a remotevibe volume", name))
+		return
+	}
+
+	ct, err := s.docker.Inspect(r.Context(), s.containerName(id))
+	if err != nil && err != dockerx.ErrNotFound {
+		writeErr(w, http.StatusBadGateway, err)
+		return
+	}
+	if ct != nil {
+		writeErr(w, http.StatusConflict,
+			fmt.Errorf("session %q still has a container; stop it before deleting %s", id, name))
+		return
+	}
+
+	if err := s.docker.RemoveVolume(r.Context(), name); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.log.Info("volume removed", "volume", name)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // --- session mapping -------------------------------------------------------
 
 func (s *Server) sessions(ctx context.Context) ([]Session, error) {
@@ -370,14 +532,15 @@ func (s *Server) sessions(ctx context.Context) ([]Session, error) {
 	if err != nil {
 		return nil, err
 	}
+	sizes, sizesKnown := s.volumeSizes(ctx)
 	out := make([]Session, 0, len(containers))
 	for _, ct := range containers {
-		out = append(out, s.toSession(ct))
+		out = append(out, s.toSession(ct, sizes, sizesKnown))
 	}
 	return out, nil
 }
 
-func (s *Server) toSession(ct dockerx.Container) Session {
+func (s *Server) toSession(ct dockerx.Container, sizes map[string]int64, sizesKnown bool) Session {
 	id := strings.TrimPrefix(ct.Name, s.cfg.ContainerName)
 	sess := Session{
 		ID:        id,
@@ -387,6 +550,10 @@ func (s *Server) toSession(ct dockerx.Container) Session {
 		Name:      ct.Labels[dockerx.LabelName],
 		Container: ct.Name,
 		Message:   s.note(id),
+		DiskKnown: sizesKnown,
+	}
+	if sizesKnown {
+		sess.DiskBytes = sizes[s.volumeName(id)] + sizes[s.homeVolume(id)]
 	}
 	if t, err := time.Parse(time.RFC3339, ct.Labels[dockerx.LabelCreated]); err == nil {
 		sess.CreatedAt = t
