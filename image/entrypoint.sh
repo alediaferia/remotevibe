@@ -13,7 +13,9 @@ set -euo pipefail
 log() { printf '[remotevibe] %s\n' "$*"; }
 fail() { printf '[remotevibe] ERROR: %s\n' "$*" >&2; exit 1; }
 
-: "${RV_REPO:?RV_REPO (owner/name) is required}"
+if [[ -z "${RV_REPO:-}" && -z "${RV_PROJECT:-}" ]]; then
+  fail "either RV_REPO (owner/name, to clone) or RV_PROJECT (a folder name, for a new empty project) is required"
+fi
 : "${RV_AGENT_CMD:?RV_AGENT_CMD is required}"
 BRANCH="${RV_BRANCH:-}"
 STATE_DIR="$HOME/.remotevibe"
@@ -54,20 +56,33 @@ else
 fi
 
 # --- checkout ---------------------------------------------------------------
-REPO_DIR="/workspace/${RV_REPO##*/}"
-if [[ -d "$REPO_DIR/.git" ]]; then
-  log "reusing existing checkout at $REPO_DIR"
-  git -C "$REPO_DIR" remote set-url origin "https://github.com/${RV_REPO}.git"
-  git -C "$REPO_DIR" fetch --prune origin || log "fetch failed; continuing with local state"
-  if [[ -n "$BRANCH" ]]; then
-    git -C "$REPO_DIR" checkout "$BRANCH" 2>/dev/null || log "could not switch to $BRANCH; staying on current branch"
+if [[ -n "${RV_REPO:-}" ]]; then
+  REPO_DIR="/workspace/${RV_REPO##*/}"
+  if [[ -d "$REPO_DIR/.git" ]]; then
+    log "reusing existing checkout at $REPO_DIR"
+    git -C "$REPO_DIR" remote set-url origin "https://github.com/${RV_REPO}.git"
+    git -C "$REPO_DIR" fetch --prune origin || log "fetch failed; continuing with local state"
+    if [[ -n "$BRANCH" ]]; then
+      git -C "$REPO_DIR" checkout "$BRANCH" 2>/dev/null || log "could not switch to $BRANCH; staying on current branch"
+    fi
+  else
+    log "cloning ${RV_REPO}${BRANCH:+ (branch $BRANCH)}"
+    clone_args=(--recurse-submodules)
+    [[ -n "$BRANCH" ]] && clone_args+=(--branch "$BRANCH")
+    git clone "${clone_args[@]}" "https://github.com/${RV_REPO}.git" "$REPO_DIR" \
+      || fail "clone failed — check that RV_GITHUB_TOKEN can read ${RV_REPO}"
   fi
 else
-  log "cloning ${RV_REPO}${BRANCH:+ (branch $BRANCH)}"
-  clone_args=(--recurse-submodules)
-  [[ -n "$BRANCH" ]] && clone_args+=(--branch "$BRANCH")
-  git clone "${clone_args[@]}" "https://github.com/${RV_REPO}.git" "$REPO_DIR" \
-    || fail "clone failed — check that RV_GITHUB_TOKEN can read ${RV_REPO}"
+  # New, empty project: no remote to clone, just a folder the agent starts in.
+  # It stays a local-only git repo until someone pushes it somewhere by hand.
+  REPO_DIR="/workspace/${RV_PROJECT}"
+  if [[ -d "$REPO_DIR/.git" ]]; then
+    log "reusing existing project at $REPO_DIR"
+  else
+    log "creating new empty project at $REPO_DIR"
+    mkdir -p "$REPO_DIR"
+    git -C "$REPO_DIR" init -q
+  fi
 fi
 
 # --- skip first-run prompts -------------------------------------------------

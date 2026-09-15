@@ -1,4 +1,5 @@
-// Package ghclient lists the repositories the configured token can see.
+// Package ghclient lists the repositories the configured token can see, and
+// can create new ones.
 //
 // remotevibe is a single-user tool: one fine-grained personal access token
 // covers listing repos here, cloning inside the container, and pushing back.
@@ -6,6 +7,7 @@
 package ghclient
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -95,6 +97,67 @@ func (c *Client) Get(ctx context.Context, fullName string) (*Repo, error) {
 		}
 	}
 	return nil, fmt.Errorf("repository %q is not visible to this token", fullName)
+}
+
+// Create makes a new, empty repository under the token's account and returns
+// it. Unlike List/Get, this needs repository-creation permission: a classic
+// PAT needs the "repo" scope, a fine-grained one needs "Administration: read
+// and write" on the target account in addition to the "Contents" access the
+// rest of this client relies on.
+func (c *Client) Create(ctx context.Context, name string, private bool) (*Repo, error) {
+	body, err := json.Marshal(map[string]any{
+		"name":      name,
+		"private":   private,
+		"auto_init": false,
+	})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiBase+"/user/repos", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("github: %w", err)
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusCreated:
+		// fall through
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return nil, fmt.Errorf("github rejected repo creation (%s) — RV_GITHUB_TOKEN needs repository-creation "+
+			"permission (classic PAT: \"repo\" scope; fine-grained PAT: \"Administration: read and write\")", resp.Status)
+	case http.StatusUnprocessableEntity:
+		return nil, fmt.Errorf("github rejected repo creation (%s) — a repository named %q may already exist", resp.Status, name)
+	default:
+		return nil, fmt.Errorf("github returned %s creating the repository", resp.Status)
+	}
+
+	var r apiRepo
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		return nil, fmt.Errorf("github: decode: %w", err)
+	}
+	created := Repo{
+		FullName:      r.FullName,
+		Name:          r.Name,
+		Owner:         r.Owner.Login,
+		Private:       r.Private,
+		Description:   r.Description,
+		DefaultBranch: r.DefaultBranch,
+		PushedAt:      r.PushedAt,
+		Language:      r.Language,
+	}
+	// The cached listing is now stale; drop it so the new repo shows up next
+	// time the phone asks, rather than special-casing one entry into the cache.
+	c.Invalidate()
+	return &created, nil
 }
 
 // Invalidate drops the cached repo list (used after an explicit refresh).
