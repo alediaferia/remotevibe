@@ -24,6 +24,10 @@ const (
 	LabelAgent   = "rv.agent"
 	LabelName    = "rv.name"
 	LabelCreated = "rv.created"
+	// LabelProject marks a session started from an empty, local-only project
+	// (no GitHub repo) rather than a clone. Its value is the project's folder
+	// name; LabelRepo is empty on these sessions.
+	LabelProject = "rv.project"
 )
 
 type Client struct {

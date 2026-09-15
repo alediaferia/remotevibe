@@ -32,6 +32,7 @@
     activeStopConfirm: null, // session id currently in "confirm stop" state
     activePurgeConfirm: null, // session id currently in "confirm stop & delete" state
     startSheetRepo: null,    // repo object the start sheet is open for
+    startSheetMode: "repo",  // "repo" | "project" — which fields the start sheet shows
     startSheetAgent: "claude",
     starting: false,
     logsSessionId: null,
@@ -65,12 +66,22 @@
     reposEmpty: document.getElementById("repos-empty"),
     reposLoading: document.getElementById("repos-loading"),
 
+    newProjectOpen: document.getElementById("new-project-open"),
+
     startSheetBackdrop: document.getElementById("start-sheet-backdrop"),
     startSheet: document.getElementById("start-sheet"),
+    startSheetTitle: document.getElementById("start-sheet-title"),
     startSheetClose: document.getElementById("start-sheet-close"),
+    startSheetRepoFields: document.getElementById("start-sheet-repo-fields"),
     startSheetRepoName: document.getElementById("start-sheet-repo-name"),
     startSheetRepoMeta: document.getElementById("start-sheet-repo-meta"),
     startBranch: document.getElementById("start-branch"),
+    startSheetProjectFields: document.getElementById("start-sheet-project-fields"),
+    startProjectName: document.getElementById("start-project-name"),
+    startProjectGithub: document.getElementById("start-project-github"),
+    startProjectPrivateRow: document.getElementById("start-project-private-row"),
+    startProjectPrivate: document.getElementById("start-project-private"),
+    startProjectHint: document.getElementById("start-project-hint"),
     agentClaude: document.getElementById("agent-claude"),
     agentCodex: document.getElementById("agent-codex"),
     startSubmit: document.getElementById("start-submit"),
@@ -127,6 +138,25 @@
         return { session: data.session, alreadyExisted: true };
       }
       if (!res.ok) throw new ApiError(data.error || "Failed to start session", res.status);
+      return { session: data.session, alreadyExisted: false };
+    },
+
+    async createProject(project, agent, { createGithubRepo, isPrivate } = {}) {
+      const res = await apiFetch("/api/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project,
+          agent,
+          create_github_repo: !!createGithubRepo,
+          private: !!isPrivate,
+        }),
+      });
+      const data = await parseJson(res);
+      if (res.status === 409) {
+        return { session: data.session, alreadyExisted: true };
+      }
+      if (!res.ok) throw new ApiError(data.error || "Failed to create project", res.status);
       return { session: data.session, alreadyExisted: false };
     },
 
@@ -298,12 +328,14 @@
     const confirmingPurge = state.activePurgeConfirm === session.id;
     const diskLabel = session.disk_known ? formatBytes(session.disk_bytes) : "—";
 
+    const displayName = session.repo || session.project || "—";
+
     card.innerHTML = `
       <div class="session-card-top">
         <div>
-          <div class="session-repo">${escapeHtml(session.repo)}</div>
+          <div class="session-repo">${escapeHtml(displayName)}</div>
           <div class="session-meta">
-            <span>${escapeHtml(session.branch || "—")}</span>
+            <span>${escapeHtml(session.repo ? (session.branch || "—") : "new project")}</span>
             <span class="dot">${escapeHtml(session.agent || "claude")}</span>
             <span class="dot">${relativeTime(session.created_at)}</span>
             <span class="dot">${escapeHtml(diskLabel)}</span>
@@ -323,7 +355,7 @@
       </div>
     `;
 
-    card.querySelector('[data-action="logs"]').addEventListener("click", () => openLogsSheet(session.id, session.repo));
+    card.querySelector('[data-action="logs"]').addEventListener("click", () => openLogsSheet(session.id, displayName));
     card.querySelector('[data-action="stop"]').addEventListener("click", () => handleStopClick(session.id));
     card.querySelector('[data-action="purge"]').addEventListener("click", () => handlePurgeClick(session.id));
 
@@ -633,10 +665,18 @@
    * 9. Start sheet
    * ------------------------------------------------------------------ */
 
+  function setStartSheetMode(mode) {
+    state.startSheetMode = mode;
+    el.startSheetRepoFields.hidden = mode !== "repo";
+    el.startSheetProjectFields.hidden = mode !== "project";
+    el.startSheetTitle.textContent = mode === "project" ? "New project" : "Start session";
+  }
+
   function openStartSheet(repo) {
     state.startSheetRepo = repo;
     state.startSheetAgent = "claude";
     setAgentSelection("claude");
+    setStartSheetMode("repo");
 
     el.startSheetRepoName.textContent = repo.full_name;
     const bits = [];
@@ -650,6 +690,33 @@
 
     el.startSheetBackdrop.hidden = false;
   }
+
+  function openNewProjectSheet() {
+    state.startSheetRepo = null;
+    state.startSheetAgent = "claude";
+    setAgentSelection("claude");
+    setStartSheetMode("project");
+
+    el.startProjectName.value = "";
+    el.startProjectGithub.checked = false;
+    el.startProjectPrivate.checked = true;
+    setProjectGithubToggle(false);
+    setStartSubmitting(false);
+
+    el.startSheetBackdrop.hidden = false;
+    el.startProjectName.focus();
+  }
+
+  function setProjectGithubToggle(isOn) {
+    el.startProjectPrivateRow.hidden = !isOn;
+    el.startProjectHint.textContent = isOn
+      ? "Creates a new GitHub repository and clones it — your GitHub token needs permission to create repos."
+      : "Creates an empty folder in the workspace — no GitHub repo needed to start. You can push it to GitHub yourself later.";
+  }
+
+  el.startProjectGithub.addEventListener("change", () => {
+    setProjectGithubToggle(el.startProjectGithub.checked);
+  });
 
   function closeStartSheet() {
     el.startSheetBackdrop.hidden = true;
@@ -670,8 +737,34 @@
   }
 
   async function handleStartSubmit() {
+    if (state.starting) return;
+
+    if (state.startSheetMode === "project") {
+      const name = el.startProjectName.value.trim();
+      if (!name) {
+        showBanner("Project name is required");
+        return;
+      }
+      setStartSubmitting(true);
+      try {
+        const { session, alreadyExisted } = await api.createProject(name, state.startSheetAgent, {
+          createGithubRepo: el.startProjectGithub.checked,
+          isPrivate: el.startProjectPrivate.checked,
+        });
+        closeStartSheet();
+        await refreshSessions();
+        schedulePoll();
+        showReadyCallout(session ? (session.repo || session.project) : name, alreadyExisted);
+      } catch (err) {
+        showBanner(err.message || "Failed to create project");
+      } finally {
+        setStartSubmitting(false);
+      }
+      return;
+    }
+
     const repo = state.startSheetRepo;
-    if (!repo || state.starting) return;
+    if (!repo) return;
 
     const branch = el.startBranch.value.trim() || repo.default_branch;
     setStartSubmitting(true);
@@ -701,6 +794,7 @@
     el.readyCallout.hidden = false;
   }
 
+  el.newProjectOpen.addEventListener("click", openNewProjectSheet);
   el.startSheetClose.addEventListener("click", closeStartSheet);
   el.startSheetBackdrop.addEventListener("click", (e) => {
     if (e.target === el.startSheetBackdrop) closeStartSheet();

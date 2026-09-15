@@ -29,6 +29,9 @@ type Session struct {
 	ID        string    `json:"id"`
 	Repo      string    `json:"repo"`
 	Branch    string    `json:"branch"`
+	// Project is set instead of Repo for a session started from an empty,
+	// local-only project rather than a clone — see LabelProject.
+	Project   string    `json:"project,omitempty"`
 	Agent     string    `json:"agent"`
 	Name      string    `json:"name"`
 	Status    string    `json:"status"` // starting | running | stopped | error
@@ -101,6 +104,24 @@ var slugRe = regexp.MustCompile(`[^a-z0-9]+`)
 // makes "start" idempotent per repository.
 func slug(repo string) string {
 	return strings.Trim(slugRe.ReplaceAllString(strings.ToLower(repo), "-"), "-")
+}
+
+// projectNameRe bounds what a new-project name can be. It becomes a literal
+// directory name inside the container (RV_PROJECT, expanded unquoted-adjacent
+// to /workspace in the entrypoint) and a Docker container/volume name suffix
+// on the daemon side, so slashes, dots-only segments and other path or
+// label-breaking characters are rejected up front rather than sanitized.
+var projectNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+
+func validProjectName(name string) error {
+	if !projectNameRe.MatchString(name) {
+		return fmt.Errorf("project name must be 1-64 characters, starting with a letter or digit, " +
+			"and contain only letters, digits, '.', '_' or '-'")
+	}
+	if strings.Contains(name, "..") {
+		return fmt.Errorf("project name must not contain '..'")
+	}
+	return nil
 }
 
 func (s *Server) containerName(id string) string { return s.cfg.ContainerName + id }
@@ -193,6 +214,14 @@ type createRequest struct {
 	Repo   string `json:"repo"`
 	Branch string `json:"branch"`
 	Agent  string `json:"agent"`
+	// Project starts a brand-new, empty project instead of cloning Repo: just
+	// a folder name, no GitHub repo required. Mutually exclusive with Repo.
+	Project string `json:"project"`
+	// CreateGitHubRepo, only meaningful alongside Project, makes an empty
+	// GitHub repository named Project before starting the session, instead of
+	// a purely local one. Private controls its visibility.
+	CreateGitHubRepo bool `json:"create_github_repo"`
+	Private          bool `json:"private"`
 }
 
 func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
@@ -202,8 +231,16 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Repo = strings.TrimSpace(req.Repo)
-	if req.Repo == "" {
-		writeErr(w, http.StatusBadRequest, fmt.Errorf("repo is required"))
+	req.Project = strings.TrimSpace(req.Project)
+	switch {
+	case req.Repo == "" && req.Project == "":
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("repo or project is required"))
+		return
+	case req.Repo != "" && req.Project != "":
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("repo and project are mutually exclusive"))
+		return
+	case req.CreateGitHubRepo && req.Project == "":
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("create_github_repo requires project"))
 		return
 	}
 
@@ -217,36 +254,90 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The repo must be visible to the token; this also gives us the default
-	// branch and a canonical owner/name spelling.
-	repo, err := s.gh.Get(r.Context(), req.Repo)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
+	// id, sessionName and the labels/env below diverge for the two modes;
+	// repo stays nil for a new project.
+	var (
+		repo        *ghclient.Repo
+		branch      string
+		id          string
+		sessionName string
+	)
+	if req.Project != "" {
+		if err := validProjectName(req.Project); err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		if req.CreateGitHubRepo {
+			// Once this succeeds the repo exists on GitHub whether or not the
+			// rest of this request goes on to succeed; that's an acceptable
+			// orphan (same as any other failed-mid-way session start) rather
+			// than something worth transactional cleanup for a single-user tool.
+			created, err := s.gh.Create(r.Context(), req.Project, req.Private)
+			if err != nil {
+				writeErr(w, http.StatusBadGateway, err)
+				return
+			}
+			repo = created
+			id = slug(repo.FullName)
+			sessionName = repo.Name
+			// branch stays "": the repo has no commits yet, and `git clone
+			// --branch <default>` against zero refs is a fatal error, not a
+			// no-op — verified against a local bare repo. A plain clone lands
+			// on the default branch once it has one.
+		} else {
+			// validProjectName already restricts this to Docker-safe characters
+			// (starts alnum, then alnum/._- only), so it is used as-is rather
+			// than through slug(): slug() lowercases and collapses '.', '_' and
+			// '-' onto the same separator, which would make distinct names like
+			// "my-project" and "my.project" collide on the same id.
+			//
+			// The "p--" prefix (a double hyphen, not "p-") keeps a project's id
+			// permanently out of a repo's id space: slugRe replaces every *run*
+			// of non-alphanumerics with a single "-", so slug() can never emit
+			// two consecutive hyphens anywhere in its output — no
+			// slug(repo.FullName) can equal, or even contain, this prefix. A
+			// single-hyphen "p-" doesn't have that guarantee: e.g.
+			// slug("p/app") == "p-app", identical to a project literally named
+			// "app".
+			id = "p--" + req.Project
+			sessionName = req.Project
+		}
+	} else {
+		// The repo must be visible to the token; this also gives us the default
+		// branch and a canonical owner/name spelling.
+		repo, err = s.gh.Get(r.Context(), req.Repo)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		branch = strings.TrimSpace(req.Branch)
+		if branch == "" {
+			branch = repo.DefaultBranch
+		}
+		id = slug(repo.FullName)
+		sessionName = repo.Name
 	}
-	branch := strings.TrimSpace(req.Branch)
-	if branch == "" {
-		branch = repo.DefaultBranch
+	if s.cfg.SessionPrefix != "" {
+		sessionName = s.cfg.SessionPrefix + "/" + sessionName
 	}
 
-	id := slug(repo.FullName)
 	name := s.containerName(id)
 
 	if !s.acquire(id) {
 		writeJSON(w, http.StatusConflict, map[string]any{
-			"error": "a session for this repository is already starting",
+			"error": "a session for this repository or project is already starting",
 		})
 		return
 	}
 	defer s.release(id)
 
-	// Idempotent start: an existing container for this repo wins. A stopped one
-	// is replaced, but its volumes survive, so the checkout and the agent's
-	// conversation carry over.
+	// Idempotent start: an existing container for this id wins. A stopped one
+	// is replaced, but its volumes survive, so the checkout (or project folder)
+	// and the agent's conversation carry over.
 	if existing, err := s.docker.Inspect(r.Context(), name); err == nil && existing != nil {
 		if existing.State == "running" {
 			writeJSON(w, http.StatusConflict, map[string]any{
-				"error":   "a session for this repository is already running",
+				"error":   "a session for this repository or project is already running",
 				"session": s.toSession(*existing, nil, false),
 			})
 			return
@@ -254,42 +345,53 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		s.log.Info("replacing stopped session container", "session", id)
 		if err := s.docker.Remove(r.Context(), name, nil, false); err != nil {
 			writeErr(w, http.StatusInternalServerError,
-				fmt.Errorf("could not clear the previous container for this repository: %w", err))
+				fmt.Errorf("could not clear the previous container for this session: %w", err))
 			return
 		}
 	}
 
-	sessionName := repo.Name
-	if s.cfg.SessionPrefix != "" {
-		sessionName = s.cfg.SessionPrefix + "/" + repo.Name
+	repoFullName, sessionProject := "", ""
+	if repo != nil {
+		repoFullName = repo.FullName
+	} else {
+		sessionProject = req.Project
+	}
+
+	labels := map[string]string{
+		dockerx.LabelSession: "1",
+		dockerx.LabelRepo:    repoFullName,
+		dockerx.LabelBranch:  branch,
+		dockerx.LabelAgent:   drv.Name(),
+		dockerx.LabelName:    sessionName,
+		dockerx.LabelCreated: time.Now().UTC().Format(time.RFC3339),
+	}
+	env := map[string]string{
+		"RV_AGENT": drv.Name(),
+		"RV_AGENT_CMD": drv.Command(agent.Spec{
+			Repo:           repoFullName,
+			Branch:         branch,
+			SessionName:    sessionName,
+			PermissionMode: s.cfg.PermissionMode,
+			Model:          s.cfg.Model,
+			ExtraArgs:      s.cfg.ExtraArgs,
+		}),
+		"RV_SESSION_ID": id,
+	}
+	if repo != nil {
+		env["RV_REPO"] = repo.FullName
+		env["RV_BRANCH"] = branch
+	} else {
+		// No clone: the entrypoint creates an empty folder and git-inits it.
+		labels[dockerx.LabelProject] = sessionProject
+		env["RV_PROJECT"] = sessionProject
 	}
 
 	spec := dockerx.RunSpec{
-		Name:  name,
-		Image: s.cfg.Image,
-		Labels: map[string]string{
-			dockerx.LabelSession: "1",
-			dockerx.LabelRepo:    repo.FullName,
-			dockerx.LabelBranch:  branch,
-			dockerx.LabelAgent:   drv.Name(),
-			dockerx.LabelName:    sessionName,
-			dockerx.LabelCreated: time.Now().UTC().Format(time.RFC3339),
-		},
+		Name:    name,
+		Image:   s.cfg.Image,
+		Labels:  labels,
 		EnvPass: append([]string{"RV_GITHUB_TOKEN", "RV_GIT_NAME", "RV_GIT_EMAIL"}, drv.Env()...),
-		Env: map[string]string{
-			"RV_REPO":   repo.FullName,
-			"RV_BRANCH": branch,
-			"RV_AGENT":  drv.Name(),
-			"RV_AGENT_CMD": drv.Command(agent.Spec{
-				Repo:           repo.FullName,
-				Branch:         branch,
-				SessionName:    sessionName,
-				PermissionMode: s.cfg.PermissionMode,
-				Model:          s.cfg.Model,
-				ExtraArgs:      s.cfg.ExtraArgs,
-			}),
-			"RV_SESSION_ID": id,
-		},
+		Env:     env,
 		Volumes: []string{
 			s.volumeName(id) + ":/workspace",
 			s.homeVolume(id) + ":" + config.ConfigDir,
@@ -321,12 +423,12 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.clearNote(id)
-	s.log.Info("session started", "session", id, "repo", repo.FullName, "branch", branch, "agent", drv.Name())
+	s.log.Info("session started", "session", id, "repo", repoFullName, "project", sessionProject, "branch", branch, "agent", drv.Name())
 
 	ct, err := s.docker.Inspect(r.Context(), name)
 	if err != nil || ct == nil {
 		writeJSON(w, http.StatusCreated, map[string]any{"session": Session{
-			ID: id, Repo: repo.FullName, Branch: branch, Agent: drv.Name(),
+			ID: id, Repo: repoFullName, Branch: branch, Project: sessionProject, Agent: drv.Name(),
 			Name: sessionName, Status: "starting", Container: name, CreatedAt: time.Now().UTC(),
 		}})
 		return
@@ -335,7 +437,11 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
-	id := slug(r.PathValue("id"))
+	// Not re-slugged: a repo-derived id already equals slug(id), but a
+	// project id preserves case and '.'/'_' (see the id-construction comment
+	// in handleCreateSession), so re-slugging it here would no longer match
+	// what was stored. Callers always pass back a Session.ID verbatim.
+	id := strings.TrimSpace(r.PathValue("id"))
 	if id == "" {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("missing session id"))
 		return
@@ -351,7 +457,7 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
-	id := slug(r.PathValue("id"))
+	id := strings.TrimSpace(r.PathValue("id"))
 	tail, _ := strconv.Atoi(r.URL.Query().Get("tail"))
 	name := s.containerName(id)
 	out, err := s.docker.Logs(r.Context(), name, tail)
@@ -546,6 +652,7 @@ func (s *Server) toSession(ct dockerx.Container, sizes map[string]int64, sizesKn
 		ID:        id,
 		Repo:      ct.Labels[dockerx.LabelRepo],
 		Branch:    ct.Labels[dockerx.LabelBranch],
+		Project:   ct.Labels[dockerx.LabelProject],
 		Agent:     ct.Labels[dockerx.LabelAgent],
 		Name:      ct.Labels[dockerx.LabelName],
 		Container: ct.Name,

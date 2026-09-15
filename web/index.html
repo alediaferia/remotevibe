@@ -107,6 +107,7 @@
     <section class="section" aria-labelledby="start-heading">
       <div class="section-head">
         <h2 id="start-heading">Start a session</h2>
+        <button id="new-project-open" class="btn" type="button">+ New project</button>
       </div>
 
       <div class="search-wrap">
@@ -138,13 +139,31 @@
       </div>
 
       <div class="sheet-body">
-        <div class="sheet-repo">
-          <div id="start-sheet-repo-name" class="sheet-repo-name">&nbsp;</div>
-          <div id="start-sheet-repo-meta" class="sheet-repo-meta">&nbsp;</div>
+        <div id="start-sheet-repo-fields">
+          <div class="sheet-repo">
+            <div id="start-sheet-repo-name" class="sheet-repo-name">&nbsp;</div>
+            <div id="start-sheet-repo-meta" class="sheet-repo-meta">&nbsp;</div>
+          </div>
+
+          <label class="field-label" for="start-branch">Branch</label>
+          <input id="start-branch" class="text-input" type="text" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" />
         </div>
 
-        <label class="field-label" for="start-branch">Branch</label>
-        <input id="start-branch" class="text-input" type="text" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" />
+        <div id="start-sheet-project-fields" hidden>
+          <label class="field-label" for="start-project-name">Project name</label>
+          <input id="start-project-name" class="text-input" type="text" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="my-new-app" />
+
+          <label class="checkbox-row" for="start-project-github">
+            <input id="start-project-github" type="checkbox" />
+            <span>Also create a GitHub repository</span>
+          </label>
+          <label id="start-project-private-row" class="checkbox-row checkbox-row-nested" for="start-project-private" hidden>
+            <input id="start-project-private" type="checkbox" checked />
+            <span>Private</span>
+          </label>
+
+          <p id="start-project-hint" class="field-hint">Creates an empty folder in the workspace &mdash; no GitHub repo needed to start. You can push it to GitHub yourself later.</p>
+        </div>
 
         <div class="field-label">Agent</div>
         <div class="segmented" role="radiogroup" aria-label="Agent">
