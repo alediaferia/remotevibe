@@ -26,9 +26,9 @@ import (
 
 // Session is the API representation of one running agent.
 type Session struct {
-	ID        string    `json:"id"`
-	Repo      string    `json:"repo"`
-	Branch    string    `json:"branch"`
+	ID     string `json:"id"`
+	Repo   string `json:"repo"`
+	Branch string `json:"branch"`
 	// Project is set instead of Repo for a session started from an empty,
 	// local-only project rather than a clone — see LabelProject.
 	Project   string    `json:"project,omitempty"`
