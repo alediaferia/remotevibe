@@ -59,6 +59,10 @@ Each `make` target is a one-line wrapper — `make image` is `docker build`,
 `docker compose up -d --build` — so a host without `make` can run the commands
 directly.
 
+CI publishes both images to GHCR on every push to `main`, so a deploy is
+normally `make pull` rather than a local build — see
+[Deploying with pre-built images](#deploying-with-pre-built-images).
+
 **2. Sign in once**
 
 ```bash
@@ -102,6 +106,31 @@ Open that URL in Safari on the iPhone and add it to the home screen — it is a
 PWA, so it gets its own icon and no browser chrome. The daemon publishes only
 to loopback; `tailscale serve` is what makes it reachable, and only from your
 tailnet.
+
+### Deploying with pre-built images
+
+`.github/workflows/ci.yml` builds and pushes both images to GHCR
+(`ghcr.io/alediaferia/remotevibe-daemon` and `...-agent`) on every push to
+`main`, tagged `latest` and the commit sha. On the VPS this turns a deploy into
+a pull instead of a build:
+
+```bash
+make login   # once; prompts for username + a PAT with read:packages
+make pull    # docker compose pull + docker compose up -d
+```
+
+The repo is private, so GHCR inherits that: pulling needs the login above (a
+classic PAT, since fine-grained PATs don't yet cover package reads). `make
+login` and `make pull` both set `DOCKER_CONFIG=/opt/remotevibe/.docker` (see
+`Makefile`), so the credential lives there instead of `~/.docker/config.json`
+— it stays out of the way of, and isn't clobbered by, any other project on the
+same host. Override `DOCKER_CONFIG` if you'd rather put it somewhere else.
+
+`RV_DAEMON_IMAGE` / `RV_AGENT_IMAGE` in `.env` point compose and
+`scripts/bootstrap-auth.sh` / `verify-remote-control.sh` at the same tags —
+`.env.example` defaults both to `:latest` on GHCR. Building locally instead is
+still `make up`, which builds from source and runs the `build:` blocks in
+`docker-compose.yml`.
 
 ### Running it without compose
 

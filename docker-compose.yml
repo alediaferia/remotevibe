@@ -1,5 +1,9 @@
 # Default deployment. Put this checkout somewhere like /opt/remotevibe, create
-# .env next to it, then:
+# .env next to it, then either:
+#
+#   docker compose pull && docker compose up -d   # pull CI-built images (prod)
+#
+# or, to build locally instead of pulling:
 #
 #   docker compose --profile build build agent   # the session container image
 #   docker compose up -d --build                 # the control plane
@@ -9,7 +13,7 @@ services:
     build:
       context: .
       dockerfile: deploy/Dockerfile
-    image: remotevibe/daemon:latest
+    image: ${RV_DAEMON_IMAGE:-ghcr.io/alediaferia/remotevibe-daemon:latest}
     container_name: remotevibed
     restart: unless-stopped
     env_file: .env
@@ -35,4 +39,4 @@ services:
   agent:
     profiles: ["build"]
     build: ./image
-    image: ${RV_AGENT_IMAGE:-remotevibe/agent:latest}
+    image: ${RV_AGENT_IMAGE:-ghcr.io/alediaferia/remotevibe-agent:latest}

@@ -2,7 +2,11 @@ BINARY  ?= bin/remotevibed
 IMAGE   ?= remotevibe/agent:latest
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
-.PHONY: help build image run check auth verify fmt vet test clean install up down logs
+# Its own docker config, not ~/.docker/config.json, so the GHCR credential
+# here doesn't leak into (or get clobbered by) whatever else this host runs.
+export DOCKER_CONFIG ?= /opt/remotevibe/.docker
+
+.PHONY: help build image run check auth verify fmt vet test clean install up pull login down logs
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "};{printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
@@ -13,9 +17,19 @@ build: ## Build the daemon
 image: ## Build the session container image
 	docker build -t $(IMAGE) image
 
-up: ## Build and start the daemon with docker compose
+up: ## Build and start the daemon with docker compose (local dev)
 	docker compose --profile build build agent
 	docker compose up -d --build
+
+login: ## Log in to GHCR (prompts for username/PAT; needed once before `make pull`)
+	@mkdir -p "$(DOCKER_CONFIG)"
+	docker login ghcr.io
+
+pull: ## Pull CI-built images and start the daemon (production deploy)
+	@mkdir -p "$(DOCKER_CONFIG)"
+	docker compose pull
+	set -a; . ./.env; set +a; docker pull "$$RV_AGENT_IMAGE"
+	docker compose up -d
 
 down: ## Stop the daemon (running sessions are untouched)
 	docker compose down
